@@ -1,4 +1,4 @@
-name: keep-alive
+name: warm-ping
 
 # Pings the production function every 10 minutes so a visitor is never the
 # person who pays for a cold serverless boot / idle database wake-up. The
@@ -6,7 +6,7 @@ name: keep-alive
 # this workflow never commits (no deploy loops).
 on:
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"   # every 10 min
+    - cron: "2,12,22,32,42,52 * * * *"   # every 10 min, off-round minute
   workflow_dispatch:
 
 jobs:

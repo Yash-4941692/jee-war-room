@@ -174,10 +174,29 @@ function ringSVG(pct, size=96, color="#22d3ee", txt="", sub=""){
 /* ---------------- boot / auth ---------------- */
 async function init(){
   try{
+    await warmUpServer();
     await reloadMe(true);
     try{ await loadChapters(true); }catch(e){}
     enterApp();
   }catch(e){ showAuth(); }
+}
+/* A sleeping free-tier database takes ~15-20 s to wake. The public health
+   endpoint itself triggers the wake, so we warm it ONCE up front instead of
+   letting the login/app burst collide with the wake (that collision caused
+   the cascading 500s / slow loads). */
+async function warmUpServer(){
+  if(state.warm) return true;
+  for(let i=0;i<2;i++){
+    try{
+      const ctrl=new AbortController();
+      const to=setTimeout(()=>ctrl.abort(),40000);
+      const r=await fetch("/healthz?detail=1",{signal:ctrl.signal,cache:"no-store"});
+      clearTimeout(to);
+      if(r.ok){ state.warm=true; return true; }
+    }catch(e){ /* waking; one more long-poll attempt */ }
+    await new Promise(res=>setTimeout(res,1500));
+  }
+  return false; // let normal calls proceed; they have their own retries
 }
 function showAuth(){
   $("#boot").classList.add("hidden"); $("#app").classList.add("hidden"); $("#auth").classList.remove("hidden");
@@ -194,7 +213,10 @@ async function authSubmit(ev){
   ev.preventDefault();
   const name=$("#auth-name").value.trim(), pw=$("#auth-pass").value;
   const btn=$("#auth-btn"); btn.disabled=true; $("#auth-err").textContent="";
+  const oldBtn=btn.textContent; btn.textContent="WARMING UP…";
   try{
+    await warmUpServer();
+    btn.textContent=oldBtn;
     if(state.authMode==="signup"){
       const examDate=$("#auth-date").value || undefined;
       const r = await api("/api/auth/signup",{name,password:pw,examDate});
