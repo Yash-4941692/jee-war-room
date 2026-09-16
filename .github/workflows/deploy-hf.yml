@@ -1,0 +1,34 @@
+name: deploy-hf
+
+# Every push to main automatically deploys the app to the Hugging Face Space.
+# Requires repository secret HF_TOKEN (write token).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push code to the Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USER: ${{ vars.HF_USER }}
+          HF_SPACE: ${{ vars.HF_SPACE }}
+        run: |
+          set -e
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_USER" ] || [ -z "$HF_SPACE" ]; then
+            echo "HF_TOKEN / HF_USER / HF_SPACE not configured — skipping"; exit 0
+          fi
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git config user.name "deploy-bot"
+          git remote add hf "https://${HF_USER}:${HF_TOKEN}@huggingface.co/spaces/${HF_USER}/${HF_SPACE}"
+          # the Space repo uses the Hugging Face README frontmatter
+          cp deploy/HF_README.md README.md
+          git add -A
+          git commit -m "deploy: $(date -u +%FT%TZ)" || true
+          git push hf main --force

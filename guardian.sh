@@ -12,7 +12,8 @@ LOCK="/tmp/jwr-guardian.lock"
 DOMAIN="matrimony-reminder-relic.ngrok-free.dev"
 PUBLIC_URL="https://$DOMAIN/"
 LOCAL_PORT=8080
-BIN_DIR="/home/user/bin"
+BIN_DIR="/tmp/tools"   # large CLI binaries live outside the persisted workspace snapshot
+mkdir -p "$BIN_DIR"
 NGROK="$BIN_DIR/ngrok"
 NGROK_URL="https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz"
 NGROK_CFG="/home/user/.config/ngrok/ngrok.yml"
@@ -45,7 +46,7 @@ ensure_ngrok(){
     cp "$NGROK_CFG_BAK" "$NGROK_CFG"
     echo "[$(date '+%F %T')] restored ngrok.yml from project backup" >> "$LOG"
   fi
-  [ -x /home/user/bin/ngrok ] || chmod +x /home/user/bin/ngrok 2>/dev/null
+  [ -x "$NGROK" ] || chmod +x "$NGROK" 2>/dev/null
   "$NGROK" version >/dev/null 2>&1
 }
 

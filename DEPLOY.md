@@ -1,61 +1,40 @@
-# Deploying JEE WAR ROOM to the permanent free cloud
+# Permanent free deployment — GitHub + Hugging Face + Turso
 
-Architecture: **GitHub** (code) → **Koyeb** free web service (runs the site,
-auto-restarts, auto-redeploys on every code push) → **Turso** free cloud database
-(SQLite-compatible, survives every redeploy) → **GitHub Actions** (pings the site
-every 20 minutes so the free instance never sleeps; dumps the database weekly).
+Architecture: **GitHub** (private code repo, auto-deploy, keep-alive) →
+**Hugging Face Space** (free Docker host, permanent `*.hf.space` URL) →
+**Turso** (free cloud SQLite database, survives every rebuild).
 
----
+- No credit card anywhere.
+- Free CPU Space sleeps only after **48 h of zero traffic**; the GitHub Actions
+  hourly pinger prevents that, so it stays warm.
+- Container disk is ephemeral — all durable data lives in Turso.
+- Space repositories are public on the free tier, so no secrets are ever
+  committed: the Turso URL/token are Space **secrets** (runtime env vars).
 
-## Part 1 — Turso (the database), ~2 minutes
+## One-time setup (already automated by the agent via APIs/tokens)
 
-1. Open https://turso.tech and click **Sign in / Sign up with GitHub**
-   (authorize the Turso app).
-2. Click **Create Database**.
-   - Name: `warroom`
-   - Location/Region: **Frankfurt (fra)**
-   - Leave other options default, confirm.
-3. Open the database and copy its **Database URL** — it looks like
-   `libsql://warroom-<yourname>.turso.io`.
-4. Open the **Tokens** (or "Create Auth Token") section:
-   - permission: **Full Access (Read & Write)**
-   - expiration: **No expiration** (or the longest offered)
-   - click **Create Token**, copy the long token shown once.
-5. Send both values in the Arena chat:
-   - `TURSO_DATABASE_URL = ...`
-   - `TURSO_AUTH_TOKEN = ...`
+1. GitHub: private repo `<user>/jee-war-room`, branch `main`.
+2. Turso: database `warroom`, seeded from the local SQLite file; app token stored
+   outside git.
+3. Hugging Face: Docker Space `<user>/jee-war-room`, secrets
+   `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`; port 7860 (`deploy/HF_README.md`
+   carries the Space metadata).
+4. GitHub repository:
+   - secrets: `HF_TOKEN`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`
+   - variables: `APP_URL`, `HF_USER`, `HF_SPACE`
 
-The agent will then: create the cloud schema, migrate both accounts (Yash/Ansh,
-including logins), push the code to GitHub, and wire up automatic backups.
+## After setup
 
-## Part 2 — Koyeb (the host), ~3 minutes
+- `git push origin main` → `.github/workflows/deploy-hf.yml` auto-deploys.
+- Hourly pinger: `.github/workflows/keepalive.yml`.
+- Weekly DB dump: `.github/workflows/db-backup.yml`.
 
-1. Open https://app.koyeb.com/auth/signup → **Continue with GitHub**
-   (authorize the Koyeb GitHub app; if asked which repositories, allow
-   **jee-war-room**).
-2. Click **Create Web Service**.
-3. Source: **GitHub** → repository **jee-war-room**, branch **main**.
-4. Builder: choose **Dockerfile** (it auto-detects `/Dockerfile`).
-5. Region: **Frankfurt (Fra)**.
-6. Instance: **Free (eco/nano)**.
-7. Exposing the service (Networking section):
-   - Port **8080**, protocol HTTP
-   - Health check path: **/healthz**
-   - public service path/name: **jee-war-room**
-8. Environment Variables — add exactly two:
-   - `TURSO_DATABASE_URL` = the Database URL from Part 1
-   - `TURSO_AUTH_TOKEN` = the token from Part 1
-9. Click **Deploy**. Build takes 1–3 minutes; the service gets a permanent URL
-   like `https://jee-war-room-<yourorg>.koyeb.app`.
+## Local development
 
-Send that URL in chat. The agent then enables the keep-alive and backup
-automations pointing at it, and runs a full verification (signup/login/chat).
+    python3 server.py                      # local SQLite at data/warroom.db
+    TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... python3 server.py   # cloud DB
 
-## After deployment
+## Migration / backup tooling
 
-- The URL is permanent and never depends on the sandbox or ngrok again.
-- Every code push to `main` auto-deploys (~1–2 min).
-- GitHub pings `/healthz` every 20 minutes (free instance stay-awake) and
-  commits a database dump every Monday (restore path, even if Turso hiccups).
-- If the site is ever very briefly slow after a long quiet period, it is just
-  the free instance waking (a few seconds); the pinger normally prevents it.
+    python tools/turso_io.py migrate      # local SQLite -> Turso
+    python tools/turso_io.py dump out.sql # Turso -> SQL dump
