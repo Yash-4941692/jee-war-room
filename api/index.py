@@ -17,6 +17,13 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
+# Self-healing schema: idempotent CREATE TABLE IF NOT EXISTS + column migrations.
+# Runs once per cold instance; never touches user data.
+try:
+    server.init_db()
+except Exception as _e:  # never block a request because schema maintenance failed
+    print("init_db warning:", _e)
+
 
 class handler(server.Handler):
     def _restore_path(self):

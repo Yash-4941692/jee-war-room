@@ -5,8 +5,15 @@ Database adapter for JEE WAR ROOM.
   Turso/libSQL database over HTTPS using the `libsql` package (sqlite3-compatible
   wire protocol). The app's SQL is unchanged; this wrapper only restores the
   sqlite3.Row access style (rows by column name) that the app relies on.
+
+Performance notes for cloud mode:
+- The libsql client is created once per worker thread and reused across
+  requests (a fresh TLS+Hrana handshake on every call was the main source of
+  latency). A dead/frozen connection is transparently reconnected once.
+- Each execute() is one network round-trip, so bulk inserts must use a single
+  multi-row INSERT or executemany().
 """
-import os, re, sqlite3
+import os, re, sqlite3, threading
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
@@ -16,6 +23,16 @@ if not (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")):
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
 CLOUD = bool(TURSO_URL)
+
+_tls = threading.local()
+
+
+def _cloud_connect():
+    import libsql
+    return libsql.connect(
+        TURSO_URL, auth_token=TURSO_TOKEN,
+        _check_same_thread=False, timeout=30,
+    )
 
 
 class Row:
@@ -61,8 +78,9 @@ class Row:
 
 class _Cur:
     """Cursor wrapper turning libsql tuple rows into Row objects."""
-    def __init__(self, cur):
+    def __init__(self, cur, conn=None):
         self._cur = cur
+        self._conn = conn
 
     @property
     def description(self):
@@ -84,10 +102,15 @@ class _Cur:
         return Row(self._colnames(self._cur.description), t) if t is not None else None
 
     def execute(self, sql, params=()):
+        # route through the connection so reconnection/retry logic lives in one place
+        if self._conn is not None:
+            return self._conn.execute(sql, params)
         self._cur.execute(_translate(sql), tuple(params))
         return self
 
     def executemany(self, sql, seq):
+        if self._conn is not None:
+            return self._conn.executemany(sql, seq)
         self._cur.executemany(_translate(sql), [tuple(p) for p in seq])
         return self
 
@@ -116,32 +139,71 @@ class _Cur:
 
 
 class _Conn:
-    """Connection wrapper exposing the subset of the sqlite3 API the app uses."""
+    """Connection wrapper exposing the subset of the sqlite3 API the app uses.
+    In cloud mode the underlying libsql client is cached per worker thread."""
     def __init__(self, inner):
         self._inner = inner
 
+    def _reconnect(self):
+        try: self._inner.close()
+        except Exception: pass
+        self._inner = _cloud_connect()
+        _tls.inner = self._inner
+
+    @staticmethod
+    def _attempt(inner, sql, params, many):
+        t = _translate(sql)
+        if many:
+            return inner.executemany(t, [tuple(p) for p in params])
+        return inner.execute(t, tuple(params))
+
     def execute(self, sql, params=()):
-        return _Cur(self._inner.execute(_translate(sql), tuple(params)))
+        try:
+            cur = self._attempt(self._inner, sql, params, False)
+        except Exception:
+            if not CLOUD: raise
+            self._reconnect()
+            cur = self._attempt(self._inner, sql, params, False)
+        return _Cur(cur, self)
 
     def executemany(self, sql, seq):
-        self._inner.executemany(_translate(sql), [tuple(p) for p in seq])
-        return self
+        try:
+            cur = self._attempt(self._inner, sql, seq, True)
+        except Exception:
+            if not CLOUD: raise
+            self._reconnect()
+            cur = self._attempt(self._inner, sql, seq, True)
+        return _Cur(cur, self)
 
     def executescript(self, script):
-        self._inner.executescript(script)
+        try:
+            self._inner.executescript(script)
+        except Exception:
+            if not CLOUD: raise
+            self._reconnect()
+            self._inner.executescript(script)
         return self
 
     def commit(self):
-        self._inner.commit()
+        try:
+            self._inner.commit()
+        except Exception:
+            if not CLOUD: raise
+            self._reconnect(); self._inner.commit()
 
     def rollback(self):
-        self._inner.rollback()
+        try:
+            self._inner.rollback()
+        except Exception:
+            if not CLOUD: raise
+            self._reconnect(); self._inner.rollback()
 
     def close(self):
-        try:
-            self._inner.close()
-        except Exception:
-            pass
+        # In cloud mode keep the cached client alive for the next request on
+        # this warm worker; only local sqlite connections close per request.
+        if not CLOUD:
+            try: self._inner.close()
+            except Exception: pass
 
     # PRAGMA table_info shim used by the migration code
     def table_columns(self, tbl):
@@ -182,16 +244,16 @@ def _translate(sql):
 
 
 def db():
-    """Open a database connection (one per request, same as the original app)."""
+    """Open a database connection (one per request, same as the original app).
+    In cloud mode the underlying client is reused across requests per thread."""
     if not CLOUD:
         c = sqlite3.connect(DB_PATH, timeout=30)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA foreign_keys=ON")
         return c
-    import libsql
-    inner = libsql.connect(
-        TURSO_URL, auth_token=TURSO_TOKEN,
-        _check_same_thread=False, timeout=30,
-    )
+    inner = getattr(_tls, "inner", None)
+    if inner is None:
+        inner = _cloud_connect()
+        _tls.inner = inner
     return _Conn(inner)

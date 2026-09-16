@@ -20,7 +20,7 @@ const STATUS_LABEL = {not_started:"NOT STARTED", in_progress:"IN PROGRESS", comp
 const STATUS_ORDER = ["not_started","in_progress","revision_needed","completed"];
 
 const state = {
-  me:null, friends:[], chapters:null, targets:[],
+  me:null, friends:[], chapters:null, targets:[], announcements:[],
   view:"home", stats:{}, airDetail:null,
   wz:null, tmr:null, tmrTick:null,
   duelUid:null, chatOpen:null, chatMsgs:[], chatPoll:null, threads:[], chatPending:{},
@@ -244,6 +244,7 @@ async function reloadMe(silent){
 async function refresh(renderAgain=true){
   await reloadMe();
   try{ await loadChapters(false); }catch(e){}
+  try{ state.announcements=(await api("/api/announcements")).announcements||[]; }catch(e){}
   if(state.view==="today") await loadTargets();
   if(renderAgain) render();
 }
@@ -297,7 +298,7 @@ function viewHome(){
   const m=state.me, s=m.summary, u=m.user, air=m.air;
   const cards=(m.settings.cards||[]).filter(c=>c.enabled);
   const has=c=>cards.some(x=>x.key===c);
-  let html="";
+  let html=announcementsHTML();
   // hero
   const d=daysToExam();
   html+=`<div class="hero">
@@ -674,6 +675,49 @@ async function autoComplete(type, wz){
   }catch(e){}
 }
 
+/* ============================================================ ANNOUNCEMENTS */
+function announcementsHTML(){
+  const list=state.announcements||[];
+  if(!list.length) return "";
+  const unread=list.filter(a=>!a.read), read=list.filter(a=>a.read);
+  let h=unread.map(a=>`<div class="ann-card unread">
+    <div class="ann-top"><span>📢 ANNOUNCEMENT${isAdmin()?' · from you':''}</span><span class="muted">${esc(fmtTime(a.created_at))}</span></div>
+    <div class="ann-body">${esc(a.body).replace(/\n/g,"<br>")}</div>
+    <button class="btn small" onclick="App.dismissAnnouncement(${a.id})">Mark as read</button>
+  </div>`).join("");
+  if(read.length) h+=`<details class="ann-old"><summary>📢 Earlier announcements (${read.length})</summary>`+
+    read.map(a=>`<div class="ann-old-item"><div class="muted">${esc(fmtTime(a.created_at))}</div><div>${esc(a.body).replace(/\n/g,"<br>")}</div></div>`).join("")+
+    `</details>`;
+  return h?`<div class="ann-wrap">${h}</div>`:"";
+}
+async function dismissAnnouncement(id){
+  await api("/api/announcements/read",{id});
+  const a=state.announcements.find(x=>x.id===id); if(a) a.read=true;
+  render();
+}
+async function postAnnouncement(){
+  const ta=$("#ann-body"), body=(ta?.value||"").trim();
+  if(!body){ toast("Write something first","bad"); return; }
+  try{ await api("/api/announcements",{nonce:nonce(),body}); ta.value="";
+    toast("Announcement posted to everyone","good");
+    try{ state.announcements=(await api("/api/announcements")).announcements||[]; }catch(e){}
+    renderSettings();
+  }catch(e){ toast(e.message,"bad"); }
+}
+async function deleteAnnouncement(id){
+  if(!confirm("Delete this announcement for everyone?")) return;
+  await api(`/api/announcements/${id}/delete`,{});
+  state.announcements=state.announcements.filter(a=>a.id!==id);
+  renderSettings();
+}
+async function adminResetPw(id,name){
+  const pw=prompt(`Set a NEW password for "${name}" (min 4 characters).\nFor security, nobody — not even the admin — can view their current password.`);
+  if(pw===null) return;
+  if(pw.trim().length<4){ toast("Password too short","bad"); return; }
+  await api("/api/admin/set-password",{userId:id,password:pw.trim()});
+  toast("New password set for "+name,"good");
+}
+
 /* ============================================================ TODAY */
 async function loadTargets(){
   const d=await api("/api/targets?date="+today()); state.targets=d.targets;
@@ -684,7 +728,8 @@ async function renderToday(){
   const order={open:0,partial:1,done:2,missed:3};
   const list=[...state.targets].sort((a,b)=>order[a.status]-order[b.status]||a.id-b.id);
   const tpls=m.settings.templates;
-  let html=`<div class="t-head">
+  let html=announcementsHTML();
+  html+=`<div class="t-head">
     <div class="t-ring">${ringSVG(s.execution,70,"#ff7a1a",s.execution+"%","DONE")}
       <div><div style="font-weight:800;font-size:16px">TODAY'S TARGETS</div>
       <div class="muted">${s.done} done · ${s.partial} partial · ${s.planned-s.done-Math.floor(s.partial)-s.missed>0?(s.planned-s.done-s.partial-s.missed)+' open · ':''}${s.missed} missed</div></div></div>
@@ -1158,6 +1203,17 @@ function openChat(uid){
   if(state.view!=="chat"){ go("chat"); } else { renderChat(); }
 }
 function chatBack(){ state.chatOpen=null; renderChat(); }
+async function clearChat(uid){
+  const f=friendByUid(uid); const nm=f?f.name:"this chat";
+  if(!confirm(`Delete your copy of the chat with ${nm}?\n\nThis only clears it on YOUR device — ${nm} keeps their messages.`)) return;
+  try{
+    await api("/api/messages/clear",{with:uid});
+    if(state.chatOpen===uid){ state.chatMsgs=[]; state.chatPending[uid]=[]; }
+    const th=(state.threads||[]).find(t=>t.uid===uid); if(th){ th.last=null; th.unread=0; }
+    if(state.view==="chat") renderChat();
+    toast("Chat deleted from your device","good");
+  }catch(e){ toast(e.message||"Couldn't delete chat","bad"); }
+}
 async function renderChat(){
   stopChatPoll();
   const v=$("#view"), list=state.friends;
@@ -1211,7 +1267,10 @@ async function loadThread(mark){
   const f=friendByUid(uid); if(!f) return;
   const after = state.chatMsgs.length?state.chatMsgs[state.chatMsgs.length-1].id:0;
   let d;
-  try{ d=await api(`/api/messages?with=${uid}&after=${after}`); }catch(e){ return; }
+  try{ d=await api(`/api/messages?with=${uid}&after=${after}`); }
+  catch(e){ if(mark===true){ const p0=document.getElementById("chat-pane");
+    if(p0 && state.chatOpen===uid) p0.innerHTML=`<div class="empty"><span class="e">📡</span>Slow connection — messages didn't load.<br><button class="btn-primary" style="margin-top:10px" onclick="App.loadThread(true)">RETRY</button></div>`; }
+    return; }
   const incoming=d.messages||[];
   const full=(mark===true);
   if(full) state.chatMsgs=incoming;
@@ -1246,7 +1305,9 @@ function chatPaneHTML(f,msgs){
   return `<div class="chat-head">
       <button class="m-x" onclick="App.chatBack()">←</button>
       ${av(f.name,f.avatarColor,36)}<b>${esc(f.name)}</b>
-      <span class="spacer"></span><button class="btn small" onclick="App.duelWith(${f.uid})">⚔️</button>
+      <span class="spacer"></span>
+      <button class="btn small" title="Delete this chat on MY device only" onclick="App.clearChat(${f.uid})">🗑️</button>
+      <button class="btn small" onclick="App.duelWith(${f.uid})">⚔️</button>
     </div>
     <div class="msg-body">${bubbles}</div>
     <form class="chat-input" onsubmit="return App.sendChat(event)">
@@ -1572,6 +1633,34 @@ async function renderSettings(){
       <button class="btn small" onclick="App.editExam()">EDIT</button></div>
     <div class="set-row"><div class="grow"><button class="btn danger btn" onclick="App.logout()">LOGOUT</button></div></div></div>`;
 
+  // admin only: announcements + user management
+  if(isAdmin()){
+    let usersRows="", userCount=0;
+    try{
+      const us=(await api("/api/admin/users")).users||[]; userCount=us.length;
+      usersRows=us.map(x=>{
+        const pct=x.ch_total?Math.round(x.ch_done/x.ch_total*100):0;
+        const js=JSON.stringify(x.name).replace(/'/g,"&#39;");
+        return `<div class="adm-u">
+          <div class="adm-u-l"><b>${esc(x.name)}</b> <span class="muted sm">@${esc(x.code)}</span>${x.role==="admin"?' <span class="adm-tag">ADMIN</span>':""}
+          <div class="muted sm">${pct}% syllabus · ${x.act7} logs in last 7d · joined ${esc((x.created_at||"").slice(0,10))}${x.last_active?" · last study "+esc(x.last_active):(x.last_login?" · seen "+esc(fmtTime(x.last_login)):"")}</div></div>
+          ${x.role!=="admin"?`<button class="btn small" onclick='App.adminResetPw(${x.id},"${js}")'>Reset password</button>`:'<span class="muted sm">you</span>'}
+        </div>`;
+      }).join("");
+    }catch(e){ usersRows=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
+    const anns=(state.announcements||[]).slice(0,10).map(a=>`<div class="adm-ann"><div>${esc(a.body).replace(/\n/g,"<br>")}</div>
+      <div class="muted sm">${esc(fmtTime(a.created_at))} · <a class="linklike" onclick="App.deleteAnnouncement(${a.id})">delete</a></div></div>`).join("")
+      ||'<div class="muted sm">No announcements yet.</div>';
+    h+=`<div class="card set-card"><h3>📢 ANNOUNCE</h3>
+      <div class="muted sm" style="margin:6px 0">Goes to <b>every</b> user instantly as a single action — no matter how big the user count grows.</div>
+      <textarea id="ann-body" class="addinput" rows="3" placeholder="Write an announcement for every user…" maxlength="600" style="width:100%;padding:10px;min-height:70px"></textarea>
+      <button class="btn-primary" style="margin-top:8px" onclick="App.postAnnouncement()">📢 POST TO EVERYONE</button>
+      <div class="adm-anns">${anns}</div></div>
+    <div class="card set-card"><h3>👥 REGISTERED USERS${userCount?` <span class="muted" style="font-weight:400;font-size:11px">(${userCount})</span>`:""}</h3>
+      <div class="muted sm" style="margin:6px 0">🔐 Passwords are stored one-way encrypted — <b>nobody, not even you, can view a password</b>. If someone forgets theirs, set a new one and tell them.</div>
+      <div class="adm-ul">${usersRows}</div></div>`;
+  }
+
   // friends
   const fl=state.friends;
   h+=`<div class="card set-card"><h3>🤝 FRIENDS (${fl.length}/10)</h3>
@@ -1828,10 +1917,11 @@ return {
   fMode, fCustom, fCustomSet, fSub, fStart, fPause, fResume, fFinish, fCancel, emergency, startEmergency,
   editExam, saveExam, connectHome, connectDuel,
   aGo, aRange, mkChip, step, mkSave, delMock, mkSaveQuick, erChip, erSave, delError,
-  duelWith, openChat, chatBack, sendChat, retryChat, chatConnect, chatConnectModal,
+  duelWith, openChat, chatBack, clearChat, loadThread, sendChat, retryChat, chatConnect, chatConnectModal,
   setName, setColor, copyCode, unlink, connectSettings, toggle, toggleCard, moveCard,
   toggleActivity, addActivity, removeActivity, addMetric, toggleMetric, moveMetric, removeMetric,
   addTemplate, editTemplate, saveTemplate, removeTemplate, saveXP, saveWeights, exportData, wipeData,
+  dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw,
   beginTimer,
 };
 })();

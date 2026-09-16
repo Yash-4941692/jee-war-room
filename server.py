@@ -77,6 +77,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS messages(
       id INTEGER PRIMARY KEY, sender INTEGER NOT NULL, recipient INTEGER NOT NULL,
       body TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT);
+    CREATE TABLE IF NOT EXISTS announcements(
+      id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS ix_msg_pair ON messages(recipient, sender, id);
     CREATE INDEX IF NOT EXISTS ix_act_day ON activities(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_t_day ON targets(user_id, day);
@@ -93,12 +95,28 @@ def init_db():
         c.execute("ALTER TABLE chapters ADD COLUMN lectures_total INTEGER NOT NULL DEFAULT 0")
     if "lectures_done" not in cols("chapters"):
         c.execute("ALTER TABLE chapters ADD COLUMN lectures_done INTEGER NOT NULL DEFAULT 0")
+    if "hidden" not in cols("messages"):
+        # comma-separated user ids who cleared this message from their own chat view
+        c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
     # migrate single-partner links into the multi-friend friendships table
     c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
         SELECT id, partner_id, created_at FROM users WHERE partner_id IS NOT NULL""")
     c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
         SELECT partner_id, id, created_at FROM users WHERE partner_id IS NOT NULL""")
     c.commit(); c.close()
+
+def seed_chapters(c, uid):
+    """Insert the 61 default chapters for a user in ONE network round-trip
+    (single multi-row INSERT — 61 separate INSERTs took ~20s over HTTPS)."""
+    vals, params, n = [], [], 0
+    for subj in SUBJECTS:
+        for ch in SYL.CHAPTERS[subj]:
+            vals.append("(?,?,?,?,?)"); params += [uid, subj, ch, "not_started", n]; n += 1
+    c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES " + ",".join(vals), params)
+
+def msg_visible(uid):
+    """SQL fragment: messages this user hasn't cleared from their own view."""
+    return "instr(','||COALESCE(hidden,'')||',', ',%d,')=0" % int(uid)
 
 MAX_FRIENDS = 10
 
@@ -127,6 +145,7 @@ def default_settings():
         "airEMA": 0.88,
         "bestStreak": 0,
         "sweepDay": "",
+        "seenAnnouncements": [],
     }
 
 # Keys controlled by the admin for the whole app (per-user copies are ignored for these)
@@ -578,6 +597,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    "max": MAX_FRIENDS, "friends": [v for v in views if v]})
             if p == "/api/messages":
                 return self._send(self.messages_list(c, uid, q))
+            if p == "/api/announcements":
+                rows = c.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 50").fetchall()
+                seen = list(s.get("seenAnnouncements") or [])
+                out = []
+                for r in rows:
+                    d = rowdict(r); d["read"] = d["id"] in seen; out.append(d)
+                return self._send({"announcements": out})
+            if p == "/api/admin/users":
+                if not self.is_admin(c, uid): return self._err("Admin only.", 403)
+                since = DAY_F(date.today() - timedelta(days=7))
+                rows = c.execute("""
+                    SELECT u.id,u.name,u.code,u.role,u.created_at,
+                      (SELECT COUNT(*) FROM chapters ch WHERE ch.user_id=u.id AND ch.hidden=0 AND ch.status='completed') ch_done,
+                      (SELECT COUNT(*) FROM chapters ch WHERE ch.user_id=u.id AND ch.hidden=0) ch_total,
+                      (SELECT COUNT(*) FROM activities a WHERE a.user_id=u.id AND a.day>=?) act7,
+                      (SELECT MAX(day) FROM activities a WHERE a.user_id=u.id) last_active,
+                      (SELECT MAX(created_at) FROM sessions se WHERE se.user_id=u.id) last_login
+                    FROM users u ORDER BY u.id""", (since,)).fetchall()
+                return self._send({"users": [rowdict(r) for r in rows]})
             if p == "/api/stats":
                 return self._send(self._stats(c, uid, s, q.get("range", ["30"])[0]))
             if p == "/api/export":
@@ -623,8 +661,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ensure_snapshots(c, pid, ps)
         out = {"connected": True, "uid": pid, "name": pu["name"], "avatarColor": pu["avatar_color"],
                "examDate": pu["exam_date"], "code": pu["code"],
-               "unread": c.execute("SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL",
-                                   (uid, pid)).fetchone()["n"],
+               "unread": c.execute(f"SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL AND {msg_visible(uid)}",
+                                   (uid, pid)).fetchone()[0],
                "shareBlock": bool(sh.get("studyTime") or sh.get("targets") or sh.get("questions"))}
         if out["shareBlock"]: out["summary"] = today_summary(c, pid, ps)
         if sh.get("streak"): out["streak"] = streak_info(c, pid, ps)
@@ -814,6 +852,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p == "/api/friend/unlink": return self.friend_unlink(c, user, body)
             if p == "/api/messages": return self.send_message(c, user, body)
             if p == "/api/messages/read": return self.mark_read(c, user["id"], body)
+            if p == "/api/messages/clear": return self.clear_chat(c, user["id"], body)
             if p == "/api/activities": return self.log_activity(c, uid, s, body)
             if p == "/api/targets": return self.create_target(c, uid, body)
             if p == "/api/targets/template": return self.apply_template(c, uid, s, body)
@@ -838,6 +877,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p == "/api/timer/complete": return self.timer_complete(c, uid, s, body)
             if p == "/api/timer/cancel": return self.timer_cancel(c, uid, body)
             if p == "/api/settings": return self.update_settings(c, uid, s, body)
+            if p == "/api/announcements": return self.announcement_create(c, uid, body)
+            if p == "/api/announcements/read": return self.announcement_read(c, uid, s, body)
+            if p.startswith("/api/announcements/") and p.endswith("/delete"):
+                return self.announcement_delete(c, uid, int(p.strip("/").split("/")[-2]))
+            if p == "/api/admin/set-password": return self.admin_set_password(c, uid, body)
             if p == "/api/account/wipe": return self.wipe(c, uid)
             return self._err("Not found", 404)
         finally:
@@ -876,13 +920,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             uid = cur.lastrowid
             s = default_settings(); s["sweepDay"] = TODAY()
             save_settings(c, uid, s)
-            # preload chapters (idempotent guard)
+            # preload chapters (idempotent guard; single batched INSERT)
             if not c.execute("SELECT 1 FROM chapters WHERE user_id=? LIMIT 1", (uid,)).fetchone():
-                n = 0
-                for subj in SUBJECTS:
-                    for ch in SYL.CHAPTERS[subj]:
-                        c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)",
-                                  (uid, subj, ch, "not_started", n)); n += 1
+                seed_chapters(c, uid)
             # seed starting snapshot
             c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
             c.commit()
@@ -963,7 +1003,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception: return self._err("Invalid friend")
             if not are_friends(c, uid, other): return self._err("Not connected with that user.", 403)
             after = int(q.get("after", ["0"])[0] or 0)
-            rows = c.execute("""SELECT * FROM messages WHERE id>? AND
+            rows = c.execute(f"""SELECT * FROM messages WHERE id>? AND {msg_visible(uid)} AND
                 ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) ORDER BY id ASC LIMIT 300""",
                 (after, uid, other, other, uid)).fetchall()
             msgs = [{"id": r["id"], "from": r["sender"], "to": r["recipient"], "body": r["body"],
@@ -973,11 +1013,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return {"messages": msgs, "friendUid": other, "last": last}
         # thread list: one summary per friend
         out = []
+        vis = msg_visible(uid)
         for pid in friend_ids(c, uid):
-            r = c.execute("""SELECT * FROM messages WHERE
+            r = c.execute(f"""SELECT * FROM messages WHERE {vis} AND
                 ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) ORDER BY id DESC LIMIT 1""",
                 (uid, pid, pid, uid)).fetchone()
-            unread = c.execute("SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL",
+            unread = c.execute(f"SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL AND {vis}",
                                (uid, pid)).fetchone()["n"]
             out.append({"uid": pid, "unread": unread,
                         "last": ({"body": r["body"], "at": r["created_at"], "mine": r["sender"] == uid} if r else None)})
@@ -1004,6 +1045,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception: return self._err("Invalid friend")
         c.execute("UPDATE messages SET read_at=? WHERE recipient=? AND sender=? AND read_at IS NULL",
                   (datetime.now().isoformat(timespec="seconds"), uid, other))
+        c.commit()
+        return self._send({"ok": True})
+
+    def clear_chat(self, c, uid, body):
+        # Hide the whole conversation from THIS user only; the buddy keeps their copy.
+        try: other = int(body.get("with"))
+        except Exception: return self._err("Invalid friend")
+        c.execute(f"""UPDATE messages SET hidden = CASE WHEN instr(','||COALESCE(hidden,'')||',', ',{uid},')=0
+            THEN TRIM(COALESCE(hidden,'') || ',{uid}', ',') ELSE hidden END
+            WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?))""",
+            (uid, other, other, uid))
         c.commit()
         return self._send({"ok": True})
 
@@ -1380,6 +1432,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         r = c.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
         return bool(r and r["role"] == "admin")
 
+    # -------- announcements (admin broadcasts; everyone reads)
+    def announcement_create(self, c, uid, body):
+        if not self.is_admin(c, uid): return self._err("Only the admin can post announcements.", 403)
+        text = (body.get("body") or "").strip()
+        if not (1 <= len(text) <= 600): return self._err("Announcement must be 1–600 characters.")
+        now = datetime.now().isoformat(timespec="seconds")
+        cur = c.execute("INSERT INTO announcements(body,created_at) VALUES(?,?)", (text, now))
+        c.commit()
+        return self._send({"ok": True, "id": cur.lastrowid, "at": now})
+
+    def announcement_read(self, c, uid, s, body):
+        aid = body.get("id")
+        seen = list(s.get("seenAnnouncements") or [])
+        if aid not in seen:
+            seen.append(aid); s["seenAnnouncements"] = seen
+            save_settings(c, uid, s); c.commit()
+        return self._send({"ok": True})
+
+    def announcement_delete(self, c, uid, aid):
+        if not self.is_admin(c, uid): return self._err("Only the admin can delete announcements.", 403)
+        c.execute("DELETE FROM announcements WHERE id=?", (aid,)); c.commit()
+        return self._send({"ok": True})
+
+    def admin_set_password(self, c, uid, body):
+        if not self.is_admin(c, uid): return self._err("Admin only.", 403)
+        target = body.get("userId")
+        newpw = body.get("password") or ""
+        if len(newpw) < 4: return self._err("Password must be at least 4 characters.")
+        r = c.execute("SELECT id FROM users WHERE id=?", (target,)).fetchone() if target else None
+        if not r: return self._err("User not found.")
+        salt = hashlib.sha256(os.urandom(16)).hexdigest()
+        c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (hash_pw(newpw, salt), salt, target))
+        # existing sessions for that user stay valid; admin can tell them the new password
+        c.commit()
+        return self._send({"ok": True})
+
     def update_settings(self, c, uid, s, body):
         section = body.get("section")
         data = body.get("data")
@@ -1540,10 +1628,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
         s = default_settings(); s["sweepDay"] = TODAY()
         save_settings(c, uid, s)
-        n = 0
-        for subj in SUBJECTS:
-            for ch in SYL.CHAPTERS[subj]:
-                c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", (uid, subj, ch, "not_started", n)); n += 1
+        seed_chapters(c, uid)   # one round-trip instead of 61
         c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
         c.commit()
         return self._send({"ok": True})
