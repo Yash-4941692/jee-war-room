@@ -7,3 +7,5 @@ __pycache__/
 # tunnel credentials / machine-local deploy secrets
 deploy/*
 !deploy/HF_README.md
+.vercel
+.vercel/

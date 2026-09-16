@@ -6,11 +6,12 @@ Database adapter for JEE WAR ROOM.
   wire protocol). The app's SQL is unchanged; this wrapper only restores the
   sqlite3.Row access style (rows by column name) that the app relies on.
 """
-import os, re, sqlite3, threading
+import os, re, sqlite3
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+if not (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
@@ -134,16 +135,9 @@ class _Conn:
         self._inner.commit()
 
     def rollback(self):
-        try:
-            self._inner.rollback()
-        except Exception:
-            pass
+        self._inner.rollback()
 
     def close(self):
-        # In cloud/serverless mode the connection is a process-wide warm pool
-        # (libsql speaks stateless HTTPS). Don't tear it down per request.
-        if CLOUD:
-            return
         try:
             self._inner.close()
         except Exception:
@@ -187,17 +181,8 @@ def _translate(sql):
     return sql
 
 
-_CLOUD_LOCK = threading.Lock()
-_CLOUD_CONN = None
-
 def db():
-    """Open a database connection.
-
-    Local mode: a fresh SQLite file connection (threaded server).
-    Cloud mode: one shared warm libsql connection per process (fast across
-    serverless invocations; close() is a no-op so the pool survives requests).
-    """
-    global _CLOUD_CONN
+    """Open a database connection (one per request, same as the original app)."""
     if not CLOUD:
         c = sqlite3.connect(DB_PATH, timeout=30)
         c.row_factory = sqlite3.Row
@@ -205,11 +190,8 @@ def db():
         c.execute("PRAGMA foreign_keys=ON")
         return c
     import libsql
-    with _CLOUD_LOCK:
-        if _CLOUD_CONN is None:
-            inner = libsql.connect(
-                TURSO_URL, auth_token=TURSO_TOKEN,
-                _check_same_thread=False, timeout=30,
-            )
-            _CLOUD_CONN = _Conn(inner)
-        return _CLOUD_CONN
+    inner = libsql.connect(
+        TURSO_URL, auth_token=TURSO_TOKEN,
+        _check_same_thread=False, timeout=30,
+    )
+    return _Conn(inner)

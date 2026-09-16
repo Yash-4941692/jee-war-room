@@ -1,0 +1,14 @@
+data/
+deploy/
+.github/
+tools/
+Dockerfile
+.dockerignore
+guardian.sh
+supervise.sh
+ngrok.sh
+STATUS.md
+DEPLOY.md
+__pycache__/
+*.pyc
+.vercel/

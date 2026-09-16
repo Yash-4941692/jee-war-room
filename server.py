@@ -8,14 +8,17 @@ import http.server, socketserver, json, sqlite3, os, re, time, math, random, str
 import hashlib, hmac as hmac_mod
 from datetime import date, datetime, timedelta
 from http.cookies import SimpleCookie
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from collections import defaultdict
 import syllabus as SYL
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(BASE, "static")
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+try:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+except OSError:
+    pass  # read-only deploy bundles (Vercel) — unused when TURSO_DATABASE_URL is set
 
 PORT = int(os.environ.get("PORT", "8080"))
 SUBJECTS = SYL.SUBJECTS
@@ -463,7 +466,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute("DELETE FROM nonces WHERE created_at < ?", (time.time() - 86400,))
 
     # -------- routing
+    def _restore_vercel_path(self):
+        # On Vercel the catch-all rewrite forwards as /api/index?__path=/orig
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if "__path" in q:
+            p0 = q["__path"][0]
+            if not p0.startswith("/"): p0 = "/" + p0
+            rest = {k: v for k, v in q.items() if k != "__path"}
+            self.path = p0 + (("?" + urlencode(rest, doseq=True)) if rest else "")
+
     def do_GET(self):
+        self._restore_vercel_path()
         u = urlparse(self.path); p = u.path; q = parse_qs(u.query)
         if p == "/healthz":
             try:
@@ -480,6 +494,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.static(p)
 
     def do_POST(self):
+        self._restore_vercel_path()
         u = urlparse(self.path); p = u.path
         if p.startswith("/api/"):
             body = self._body()
@@ -861,14 +876,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             uid = cur.lastrowid
             s = default_settings(); s["sweepDay"] = TODAY()
             save_settings(c, uid, s)
-            # preload chapters (idempotent guard; single batched round-trip)
+            # preload chapters (idempotent guard)
             if not c.execute("SELECT 1 FROM chapters WHERE user_id=? LIMIT 1", (uid,)).fetchone():
-                rows = []
                 n = 0
                 for subj in SUBJECTS:
                     for ch in SYL.CHAPTERS[subj]:
-                        rows.append((uid, subj, ch, "not_started", n)); n += 1
-                c.executemany("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", rows)
+                        c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)",
+                                  (uid, subj, ch, "not_started", n)); n += 1
             # seed starting snapshot
             c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
             c.commit()
@@ -1526,11 +1540,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
         s = default_settings(); s["sweepDay"] = TODAY()
         save_settings(c, uid, s)
-        rows, n = [], 0
+        n = 0
         for subj in SUBJECTS:
             for ch in SYL.CHAPTERS[subj]:
-                rows.append((uid, subj, ch, "not_started", n)); n += 1
-        c.executemany("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", rows)
+                c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", (uid, subj, ch, "not_started", n)); n += 1
         c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
         c.commit()
         return self._send({"ok": True})

@@ -1,8 +1,7 @@
 name: deploy-vercel
 
-# Every push to main redeploys to Vercel (production).
-# Requires repository secret VERCEL_TOKEN and variables VERCEL_ORG_ID,
-# VERCEL_PROJECT_ID (filled in by the agent at first deploy).
+# Every push to main deploys to production on Vercel.
+# Requires repository secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
 on:
   push:
     branches: [main]
@@ -16,18 +15,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Install Vercel CLI
-        run: npm install -g vercel@latest
-      - name: Pull project settings and deploy
+      - name: Deploy to Vercel (production)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
-          set -e
-          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ]; then
-            echo "Vercel not configured yet — skipping"; exit 0
-          fi
-          vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-          vercel build --prod --token="$VERCEL_TOKEN"
-          vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest deploy --prod --yes --token="$VERCEL_TOKEN"

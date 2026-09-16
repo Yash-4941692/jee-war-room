@@ -1,40 +1,43 @@
-# Permanent free deployment — GitHub + Hugging Face + Turso
+# Permanent free deployment — GitHub + Vercel + Turso
 
-Architecture: **GitHub** (private code repo, auto-deploy, keep-alive) →
-**Hugging Face Space** (free Docker host, permanent `*.hf.space` URL) →
-**Turso** (free cloud SQLite database, survives every rebuild).
+Architecture: **GitHub** (private code repo) → **Vercel Hobby** (free serverless
+Python host; functions never "sleep", permanent HTTPS URL) → **Turso** (free
+cloud SQLite/libSQL database in aws-us-east-1, next to Vercel's free region).
 
 - No credit card anywhere.
-- Free CPU Space sleeps only after **48 h of zero traffic**; the GitHub Actions
-  hourly pinger prevents that, so it stays warm.
-- Container disk is ephemeral — all durable data lives in Turso.
-- Space repositories are public on the free tier, so no secrets are ever
-  committed: the Turso URL/token are Space **secrets** (runtime env vars).
+- Data lives entirely in Turso; the function container is stateless.
+- Each push to `main` auto-deploys via `.github/workflows/deploy-vercel.yml`.
+- GitHub pings `/healthz` every 30 minutes (warmth + uptime): `keepalive.yml`.
+- Weekly plain-SQL dump of the database is committed to this private repo:
+  `db-backup.yml`.
 
-## One-time setup (already automated by the agent via APIs/tokens)
+## Live endpoints
 
-1. GitHub: private repo `<user>/jee-war-room`, branch `main`.
-2. Turso: database `warroom`, seeded from the local SQLite file; app token stored
-   outside git.
-3. Hugging Face: Docker Space `<user>/jee-war-room`, secrets
-   `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`; port 7860 (`deploy/HF_README.md`
-   carries the Space metadata).
-4. GitHub repository:
-   - secrets: `HF_TOKEN`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`
-   - variables: `APP_URL`, `HF_USER`, `HF_SPACE`
+- App: https://jee-war-room-three.vercel.app
+- Health: https://jee-war-room-three.vercel.app/healthz
 
-## After setup
+## Repository configuration (already set once)
 
-- `git push origin main` → `.github/workflows/deploy-hf.yml` auto-deploys.
-- Hourly pinger: `.github/workflows/keepalive.yml`.
-- Weekly DB dump: `.github/workflows/db-backup.yml`.
+Secrets: `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`,
+`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`
+Variables: `APP_URL`
+
+## How the serverless port works
+
+- `server.Handler` is a stdlib `http.server.BaseHTTPRequestHandler`; Vercel's
+  Python runtime invokes that class directly (framework-less functions).
+- `vercel.json` rewrites every path to `/api/index?__path=...`; the handler
+  restores the original path in `Handler._restore_vercel_path()`.
+- `dbwrap.py` connects to Turso when `TURSO_DATABASE_URL` is set, otherwise to
+  the local SQLite file (dev).
+- Static files are served by the same handler; nothing else is needed.
 
 ## Local development
 
-    python3 server.py                      # local SQLite at data/warroom.db
+    python3 server.py                       # local SQLite at data/warroom.db
     TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... python3 server.py   # cloud DB
 
-## Migration / backup tooling
+## Database tooling
 
-    python tools/turso_io.py migrate      # local SQLite -> Turso
-    python tools/turso_io.py dump out.sql # Turso -> SQL dump
+    python tools/turso_io.py migrate        # local SQLite -> Turso
+    python tools/turso_io.py dump out.sql   # Turso -> SQL dump
