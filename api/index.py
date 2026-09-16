@@ -9,6 +9,7 @@ request, exactly like http.server.BaseHTTPRequestHandler.
 """
 import os
 import sys
+import threading
 from urllib.parse import urlparse, parse_qs, urlencode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,12 +18,17 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Self-healing schema: idempotent CREATE TABLE IF NOT EXISTS + column migrations.
-# Runs once per cold instance; never touches user data.
-try:
-    server.init_db()
-except Exception as _e:  # never block a request because schema maintenance failed
-    print("init_db warning:", _e)
+# Self-healing schema: idempotent CREATE TABLE IF NOT EXISTS + column
+# migrations. Runs in a BACKGROUND daemon thread so a cold/slow database can
+# never stall the function's import (that stall was the ~300s cold hangs).
+# Schema already exists in production; requests don't wait on this.
+def _bg_init():
+    try:
+        server.init_db()
+    except Exception as _e:
+        print("init_db warning:", _e)
+
+threading.Thread(target=_bg_init, daemon=True).start()
 
 
 class handler(server.Handler):

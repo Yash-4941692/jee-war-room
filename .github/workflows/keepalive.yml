@@ -13,11 +13,14 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping health endpoint (waits through a cold wake if needed)
+      - name: Ping health endpoint (retry through a cold wake if needed)
         env:
           APP_URL: ${{ vars.APP_URL }}
         run: |
           if [ -z "$APP_URL" ]; then echo "APP_URL repository variable not set yet — skipping"; exit 0; fi
-          echo "Pinging $APP_URL/healthz"
-          curl -fsS --max-time 120 "$APP_URL/healthz?detail=1"
-          echo " -> healthy"
+          echo "Warming $APP_URL/healthz (retries through a cold database wake)"
+          for i in 1 2 3 4 5 6; do
+            out=$(curl -fsS --max-time 30 "$APP_URL/healthz?detail=1" 2>&1) && { echo "$out"; echo " -> healthy"; exit 0; }
+            echo "attempt $i not ready yet, retrying in 10s..."; sleep 10
+          done
+          echo "keepalive gave up after 6 attempts"; exit 1

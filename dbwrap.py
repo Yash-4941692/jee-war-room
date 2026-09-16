@@ -2,18 +2,24 @@
 Database adapter for JEE WAR ROOM.
 - Local mode (default): stdlib sqlite3 file at data/warroom.db (dev / old setup).
 - Cloud mode: when TURSO_DATABASE_URL (or LIBSQL_URL) is set, connects to a
-  Turso/libSQL database over HTTPS using the `libsql` package (sqlite3-compatible
-  wire protocol). The app's SQL is unchanged; this wrapper only restores the
-  sqlite3.Row access style (rows by column name) that the app relies on.
+  Turso/libSQL database over HTTPS using the `libsql` package.
 
-Performance notes for cloud mode:
-- The libsql client is created once per worker thread and reused across
-  requests (a fresh TLS+Hrana handshake on every call was the main source of
-  latency). A dead/frozen connection is transparently reconnected once.
-- Each execute() is one network round-trip, so bulk inserts must use a single
-  multi-row INSERT or executemany().
+Latency/hang defences for serverless (important!):
+- The libsql client is cached per worker thread and reused, but after a
+  serverless freeze (or an NAT idle-kill of the underlying socket) a cached
+  Hrana connection can hang for MINUTES. We therefore:
+    * proactively replace the client after 20 s idle (wall clock jumps during
+      a freeze make this fire right after wake);
+    * run EVERY remote statement inside a watchdog with a hard 7 s deadline —
+      on timeout the poisoned client is abandoned and a fresh one opened, so
+      a request fails fast (and the client retries) instead of occupying the
+      function for the platform's 300 s task limit;
+    * any other exception also triggers one transparent reconnect+retry.
+- Use an https:// database URL in production (stateless Hrana HTTP: no
+  long-lived WebSocket that can be half-open).
 """
 import os, re, sqlite3, threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
@@ -23,16 +29,43 @@ if not (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")):
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
 CLOUD = bool(TURSO_URL)
+DB_TIMEOUT = float(os.environ.get("DB_TIMEOUT", "7"))   # hard per-statement deadline, seconds
 
 _tls = threading.local()
+# Watchdog pool: libsql native calls release the GIL while waiting on IO, so a
+# future thread can enforce the deadline even when the call itself never would.
+_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dbio")
 
 
 def _cloud_connect():
     import libsql
     return libsql.connect(
         TURSO_URL, auth_token=TURSO_TOKEN,
-        _check_same_thread=False, timeout=30,
+        _check_same_thread=False, timeout=DB_TIMEOUT,
     )
+
+
+def _fresh_after_connect(deadline=None):
+    """New clients may need a moment (e.g. waking a suspended database);
+    pinging here keeps the hang in a reconnect we can retry rather than in the
+    caller's statement."""
+    import time
+    inner = _cloud_connect()
+    f = _pool.submit(inner.execute, "SELECT 1")
+    try:
+        f.result(timeout=deadline or (DB_TIMEOUT + 7))
+    except Exception:
+        try: inner.close()
+        except Exception: pass
+        raise
+    _tls.inner = inner
+    _tls.last_used = time.time()
+    return inner
+
+_READ_OK = ("SELECT", "PRAGMA", "WITH", "CREATE", "INSERT OR REPLACE", "INSERT OR IGNORE")
+def _is_safe_to_retry(sql):
+    head = sql.lstrip().upper()
+    return head.startswith(_READ_OK)
 
 
 class Row:
@@ -102,7 +135,6 @@ class _Cur:
         return Row(self._colnames(self._cur.description), t) if t is not None else None
 
     def execute(self, sql, params=()):
-        # route through the connection so reconnection/retry logic lives in one place
         if self._conn is not None:
             return self._conn.execute(sql, params)
         self._cur.execute(_translate(sql), tuple(params))
@@ -115,6 +147,8 @@ class _Cur:
         return self
 
     def executescript(self, script):
+        if self._conn is not None:
+            self._conn.executescript(script); return self
         self._cur.executescript(script)
         return self
 
@@ -140,17 +174,29 @@ class _Cur:
 
 class _Conn:
     """Connection wrapper exposing the subset of the sqlite3 API the app uses.
-    In cloud mode the underlying libsql client is cached per worker thread."""
+    In cloud mode the underlying libsql client is cached per worker thread and
+    every call is bounded by the watchdog."""
     def __init__(self, inner):
         self._inner = inner
 
+    def _abandon(self):
+        """Drop a poisoned client (never block on closing it) and open fresh."""
+        old = self._inner
+        _tls.inner = None
+        try:
+            # best-effort close in the watchdog so a closing hang can't block us
+            _pool.submit(old.close)
+        except Exception:
+            pass
+        self._inner = _fresh_after_connect()
+
     def _reconnect(self):
-        import time
-        try: self._inner.close()
+        try:
+            f = _pool.submit(self._inner.close)
+            try: f.result(timeout=2)
+            except Exception: pass
         except Exception: pass
-        self._inner = _cloud_connect()
-        _tls.inner = self._inner
-        _tls.last_used = time.time()
+        self._inner = _fresh_after_connect()
 
     @staticmethod
     def _attempt(inner, sql, params, many):
@@ -159,50 +205,69 @@ class _Conn:
             return inner.executemany(t, [tuple(p) for p in params])
         return inner.execute(t, tuple(params))
 
-    def execute(self, sql, params=()):
-        try:
-            cur = self._attempt(self._inner, sql, params, False)
-        except Exception:
-            if not CLOUD: raise
+    def _run(self, sql, params, many, retried=False):
+        import time
+        # proactively replace an idle (possibly frozen/killed) client
+        if time.time() - getattr(_tls, "last_used", 0.0) > 20:
             self._reconnect()
-            cur = self._attempt(self._inner, sql, params, False)
-        return _Cur(cur, self)
+        _tls.last_used = time.time()
+        try:
+            f = _pool.submit(self._attempt, self._inner, sql, params, many)
+            return f.result(timeout=DB_TIMEOUT)
+        except FutTimeout:
+            # dead socket / waking database: abandon and retry once, fast.
+            # Only retry reads/idempotent statements; a write may have landed.
+            if retried or not _is_safe_to_retry(sql):
+                raise TimeoutError("database timed out (cold start?)")
+            self._abandon()
+            return self._run(sql, params, many, retried=True)
+        except Exception:
+            if not CLOUD or retried or not _is_safe_to_retry(sql): raise
+            self._reconnect()
+            return self._run(sql, params, many, retried=True)
+
+    def execute(self, sql, params=()):
+        return _Cur(self._run(sql, params, False), self)
 
     def executemany(self, sql, seq):
-        try:
-            cur = self._attempt(self._inner, sql, seq, True)
-        except Exception:
-            if not CLOUD: raise
-            self._reconnect()
-            cur = self._attempt(self._inner, sql, seq, True)
-        return _Cur(cur, self)
+        return _Cur(self._run(sql, list(seq), True), self)
 
     def executescript(self, script):
-        try:
-            self._inner.executescript(script)
-        except Exception:
-            if not CLOUD: raise
+        # split simple DDL scripts into statements so the watchdog bounds them
+        import time
+        if not CLOUD:
+            self._inner.executescript(script); return self
+        if time.time() - getattr(_tls, "last_used", 0.0) > 20:
             self._reconnect()
-            self._inner.executescript(script)
+        stmts = [s.strip() for s in script.split(";") if s.strip()]
+        for s in stmts:
+            self.execute(s)
         return self
 
     def commit(self):
+        import time
         try:
-            self._inner.commit()
+            f = _pool.submit(self._inner.commit)
+            f.result(timeout=DB_TIMEOUT)
+            _tls.last_used = time.time()
+        except FutTimeout:
+            if not CLOUD: raise
+            self._abandon()
+            # a fresh client autocommitted statements already; nothing to replay
         except Exception:
             if not CLOUD: raise
-            self._reconnect(); self._inner.commit()
+            self._reconnect()
 
     def rollback(self):
         try:
-            self._inner.rollback()
+            f = _pool.submit(self._inner.rollback)
+            f.result(timeout=DB_TIMEOUT)
         except Exception:
-            if not CLOUD: raise
-            self._reconnect(); self._inner.rollback()
+            if CLOUD: self._reconnect()
 
     def close(self):
-        # In cloud mode keep the cached client alive for the next request on
-        # this warm worker; only local sqlite connections close per request.
+        # Cloud: keep the cached client alive for the next request on this
+        # warm worker. Local sqlite connections close per request.
         if not CLOUD:
             try: self._inner.close()
             except Exception: pass
@@ -246,12 +311,9 @@ def _translate(sql):
 
 
 def db():
-    """Open a database connection (one per request, same as the original app).
-    In cloud mode the underlying client is reused across requests per thread,
-    but a serverless freeze can leave the cached Hrana socket half-dead: the
-    first query after that hangs for ~10 s before erroring. If this worker has
-    been idle for more than 20 s, replace the client up front (one fast
-    handshake, ~0.3 s same-region) instead of paying the hang on a user request."""
+    """Open a database connection wrapper per request. In cloud mode the
+    underlying client is created lazily and cached per worker thread; a stale
+    one is replaced up front when the worker has been idle."""
     if not CLOUD:
         c = sqlite3.connect(DB_PATH, timeout=30)
         c.row_factory = sqlite3.Row
@@ -262,11 +324,13 @@ def db():
     inner = getattr(_tls, "inner", None)
     last = getattr(_tls, "last_used", 0.0)
     if inner is not None and (time.time() - last) > 20:
-        try: inner.close()
+        try:
+            f = _pool.submit(inner.close)
+            try: f.result(timeout=2)
+            except Exception: pass
         except Exception: pass
         inner = None
     if inner is None:
-        inner = _cloud_connect()
-        _tls.inner = inner
+        inner = _fresh_after_connect()
     _tls.last_used = time.time()
     return _Conn(inner)
