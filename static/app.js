@@ -257,6 +257,7 @@ function buildNav(){
   const snLinks = NAV.map(n=>`<button class="sn ${state.view===n.id?'active':''}" onclick="App.go('${n.id}')"><span class="ic">${n.ic}</span><span class="sn-label">${n.l}</span>${badge(n)}</button>`).join("");
   $("#sidenav").innerHTML = `<div class="sn-logo">🎯 <b>JEE WAR ROOM</b></div>${snLinks}
     <div class="sn-spacer"></div>
+    <div class="sn-credit">Made by <b>Yash Sharma</b> 🎯</div>
     <div class="sn-user">${av(u.name,u.avatar_color,30)}<div style="min-width:0"><div style="font-weight:700;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(u.name)}</div>
     <button class="ghostlink" onclick="App.logout()">Logout</button></div></div>`;
   const d = daysToExam();
@@ -1682,6 +1683,8 @@ async function renderSettings(){
     <div class="set-row"><div class="grow">Download all your data (JSON backup)</div><button class="btn small" onclick="App.exportData()">EXPORT</button></div>
     <div class="set-row"><div class="grow"><span class="danger-note">Reset everything (chapters reload, all logs deleted)</span></div>
       <button class="btn small danger" onclick="App.wipeData()">RESET</button></div></div>`;
+
+  h+=`<div class="about-credit"><div class="about-mark">🎯 JEE WAR ROOM</div><div>Designed &amp; built by <b>Yash Sharma</b></div><div class="muted" style="font-size:11px">Two aspirants. One mission. No excuses.</div></div>`;
 
   $("#view").innerHTML=h;
   api("/api/air").then(a=>{
