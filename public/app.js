@@ -23,7 +23,7 @@ const state = {
   me:null, friends:[], chapters:null, targets:[], announcements:[],
   view:"home", stats:{}, airDetail:null,
   wz:null, tmr:null, tmrTick:null,
-  duelUid:null, chatOpen:null, chatMsgs:[], chatPoll:null, threads:[], chatPending:{},
+  duelUid:null, chatOpen:null, chatMsgs:[], chatPoll:null, threads:[], chatPending:{}, chatCache:{},
 };
 const isAdmin = () => !!(state.me && state.me.user && state.me.user.role === "admin");
 const friendByUid = uid => state.friends.find(f=>f.uid===uid) || null;
@@ -280,7 +280,7 @@ async function liveTick(){
   try{
     await reloadMe(); buildNav();
     if(state.view==="chat"){ refreshThreads(); }
-    else if(["home","today","jee","duel"].includes(state.view)){ render(); }
+    else if(["home","today","jee","duel"].includes(state.view)){ render(true); }
   }catch(e){ /* silent background sync */ }
   finally{ liveBusy=false; }
 }
@@ -337,16 +337,18 @@ function route(){
 }
 window.addEventListener("hashchange", route);
 
-function render(){
+function render(keepScroll){
   const v=$("#view"); if(!state.me){return;}
-  if(state.view==="home") v.innerHTML=viewHome();
-  else if(state.view==="today") renderToday();
-  else if(state.view==="jee") renderJee();
-  else if(state.view==="focus") renderFocus();
-  else if(state.view==="duel"){ v.innerHTML=viewDuel(); loadDuelWeek(); }
+  const sy=window.scrollY;
+  const restore=()=>{ if(keepScroll) requestAnimationFrame(()=>window.scrollTo({top:sy,behavior:"instant"})); };
+  if(state.view==="home"){ v.innerHTML=viewHome(); restore(); }
+  else if(state.view==="today"){ renderToday().then(restore); }
+  else if(state.view==="jee"){ renderJee(); restore(); }
+  else if(state.view==="focus"){ renderFocus(); restore(); }
+  else if(state.view==="duel"){ v.innerHTML=viewDuel(); restore(); loadDuelWeek(); }
   else if(state.view==="chat") renderChat();
-  else if(state.view==="analytics") renderAnalytics("overview");
-  else if(state.view==="settings") renderSettings();
+  else if(state.view==="analytics"){ renderAnalytics("overview"); restore(); }
+  else if(state.view==="settings"){ renderSettings(); restore(); }
   buildNav();
 }
 
@@ -782,6 +784,32 @@ async function loadAdminUsers(){
       </div>`;
     }).join("");
   }catch(e){ box.outerHTML=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
+}
+async function sendReport(){
+  const ta=$("#report-body"), text=(ta?.value||"").trim(), note=$("#report-sent");
+  if(text.length<5){ if(note) note.textContent="Please write at least 5 characters."; return; }
+  try{
+    await api("/api/report",{nonce:nonce(),body:text});
+    ta.value=""; if(note){ note.textContent="✅ Sent — thank you. The admin will see it."; }
+    setTimeout(()=>{ if(note) note.textContent=""; },8000);
+  }catch(e){ if(note) note.textContent="Couldn't send: "+e.message; }
+}
+async function loadAdminReports(){
+  const box=document.querySelector("#rep-list"); if(!box) return;
+  try{
+    const d=await api("/api/admin/reports"); const rs=d.reports||[];
+    const open=rs.filter(r=>!r.resolved);
+    const cc=document.querySelector("#rep-count"); if(cc) cc.textContent=open.length?`(${open.length} new)`:"";
+    if(!rs.length){ box.innerHTML='<div class="muted sm">No reports yet.</div>'; return; }
+    box.innerHTML=rs.slice(0,30).map(r=>`<div class="adm-u ${r.resolved?"rep-done":""}">
+      <div class="adm-u-l"><b>${esc(r.user_name||"User")}</b> <span class="muted sm">${esc(fmtTime(r.created_at))}</span>
+      <div>${esc(r.body).replace(/\n/g,"<br>")}</div></div>
+      ${r.resolved?'<span class="muted sm">✓ resolved</span>':`<button class="btn small" onclick="App.resolveReport(${r.id})">Resolve</button>`}
+    </div>`).join("");
+  }catch(e){ box.innerHTML=`<div class="muted sm">Couldn't load: ${esc(e.message)}</div>`; }
+}
+async function resolveReport(id){
+  try{ await api("/api/admin/report/resolve",{id}); loadAdminReports(); }catch(e){ toast(e.message,"bad"); }
 }
 async function adminResetPw(id,name){
   const pw=prompt(`Set a NEW password for "${name}" (min 4 characters).\nFor security, nobody — not even the admin — can view their current password.`);
@@ -1281,6 +1309,7 @@ async function clearChat(uid){
   try{
     await api("/api/messages/clear",{with:uid});
     if(state.chatOpen===uid){ state.chatMsgs=[]; state.chatPending[uid]=[]; }
+    delete state.chatCache[uid];
     const th=(state.threads||[]).find(t=>t.uid===uid); if(th){ th.last=null; th.unread=0; }
     if(state.view==="chat") renderChat();
     toast("Chat deleted from your device","good");
@@ -1302,9 +1331,18 @@ async function renderChat(){
     <div class="chat-list ${state.chatOpen?'hidden-mobile':''}" id="chat-list">${chatListHTML()}</div>
     <div class="chat-pane ${state.chatOpen?'':'hidden-mobile'}" id="chat-pane">${state.chatOpen?"<div class='empty'>Loading…</div>":`<div class="empty"><span class="e">💬</span>Pick a buddy to message.</div>`}</div>
   </div>`;
-  // shell is already on screen; load the open thread AND the list together
-  if(state.chatOpen){ loadThread(true).then(()=>startChatPoll()); refreshThreads(); }
-  else { refreshThreads(); }
+  // shell is already on screen; show cached conversation INSTANTLY, then refresh in background
+  if(state.chatOpen){
+    const cached=state.chatCache[state.chatOpen];
+    if(cached && cached.length){
+      state.chatMsgs=cached.slice();
+      const pane0=document.getElementById("chat-pane");
+      if(pane0){ pane0.innerHTML=chatPaneHTML(friendByUid(state.chatOpen),state.chatMsgs);
+        const bd=pane0.querySelector(".msg-body"); if(bd) bd.scrollTop=bd.scrollHeight; }
+    }
+    loadThread(true).then(ok=>{ if(ok!==false){ state.chatCache[state.chatOpen]=state.chatMsgs; startChatPoll(); } });
+    refreshThreads();
+  } else { refreshThreads(); }
 }
 function chatListHTML(){
   const list=state.friends;
@@ -1356,6 +1394,7 @@ async function loadThread(mark){
     pane.innerHTML=chatPaneHTML(f,state.chatMsgs);
     const body=pane.querySelector(".msg-body"); if(body) body.scrollTop=body.scrollHeight;
     const inp=pane.querySelector("#chat-text"); if(inp && mark) inp.focus({preventScroll:true});
+    state.chatCache[uid]=state.chatMsgs;
   }else if(incoming.length){
     let body=pane.querySelector(".msg-body");
     if(!body || body.querySelector(".empty")){ pane.innerHTML=chatPaneHTML(f,state.chatMsgs); body=pane.querySelector(".msg-body"); }
@@ -1363,6 +1402,7 @@ async function loadThread(mark){
       incoming.forEach(m=>body.insertAdjacentHTML("beforeend",chatBubbleHTML(m)));
       if(nearBottom) body.scrollTop=body.scrollHeight; }
   }
+  state.chatCache[uid]=state.chatMsgs;
   buildNav();
   return true;
 }
@@ -1837,6 +1877,17 @@ async function renderSettings(){
     <div class="set-row"><div class="grow">Momentum smoothing (higher = slower AIR changes)</div>${inp("air-ema",set.airEMA,"0.01")}</div>
     ${isAdmin()?'<button class="btn-primary full" style="margin-top:10px" onclick="App.saveWeights()">SAVE GLOBAL FORMULA — APPLIES TO EVERYONE</button>':''}</div>`;
 
+  // report a problem
+  h+=`<div class="card set-card"><h3>🐞 REPORT A PROBLEM</h3>
+    <div class="muted sm" style="margin:6px 0">Spotted a bug, a slow screen, or anything broken? Write it here — it goes straight to the admin${isAdmin()?" (you)":" Yash"}.</div>
+    <textarea id="report-body" class="addinput" rows="3" maxlength="600" style="width:100%;min-height:74px" placeholder="What happened, and on which screen?"></textarea>
+    <button class="btn-primary" style="margin-top:8px" onclick="App.sendReport()">SEND REPORT</button>
+    <div id="report-sent" class="muted sm" style="margin-top:6px"></div></div>`;
+  if(isAdmin()){
+    h+=`<div class="card set-card"><h3>🚩 PROBLEM REPORTS <span class="muted" id="rep-count" style="font-weight:400;font-size:11px"></span></h3>
+      <div id="rep-list" class="adm-ul"><div class="muted sm">Loading…</div></div></div>`;
+  }
+
   // data
   h+=`<div class="card set-card"><h3>🗄️ DATA</h3>
     <div class="set-row"><div class="grow">Download all your data (JSON backup)</div><button class="btn small" onclick="App.exportData()">EXPORT</button></div>
@@ -1846,7 +1897,7 @@ async function renderSettings(){
   h+=`<div class="about-credit"><div class="about-mark">🎯 JEE WAR ROOM</div><div>Designed &amp; built by <b>Yash Sharma</b></div><div class="muted" style="font-size:11px">Two aspirants. One mission. No excuses.</div></div>`;
 
   $("#view").innerHTML=h;
-  if(isAdmin()) loadAdminUsers();
+  if(isAdmin()){ loadAdminUsers(); loadAdminReports(); }
   api("/api/air").then(a=>{
     const cc=a.components, dt=a.detail;
     $("#air-explain").innerHTML=`<div class="sec-title">YOUR LIVE COMPONENTS (last 14 days)</div>
@@ -1993,6 +2044,7 @@ return {
   toggleActivity, addActivity, removeActivity, addMetric, toggleMetric, moveMetric, removeMetric,
   addTemplate, editTemplate, saveTemplate, removeTemplate, saveXP, saveWeights, exportData, wipeData,
   dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw,
+  sendReport, resolveReport,
   beginTimer,
 };
 })();

@@ -6,7 +6,7 @@ name: warm-ping
 # this workflow never commits (no deploy loops).
 on:
   schedule:
-    - cron: "2,12,22,32,42,52 * * * *"   # every 10 min, off-round minute
+    - cron: "6,16,26,36,46,56 * * * *"   # every 10 min, offset from public pinger
   workflow_dispatch:
 
 jobs:

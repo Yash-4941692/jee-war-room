@@ -21,7 +21,7 @@ from collections import defaultdict
 import syllabus as SYL
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-STATIC = os.path.join(BASE, "static")
+STATIC = os.path.join(BASE, "public")
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
 try:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -85,6 +85,9 @@ _SCHEMA_SQL = r"""
       body TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT);
     CREATE TABLE IF NOT EXISTS announcements(
       id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS reports(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, body TEXT NOT NULL,
+      created_at TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0);
     CREATE INDEX IF NOT EXISTS ix_msg_pair ON messages(recipient, sender, id);
     CREATE INDEX IF NOT EXISTS ix_act_day ON activities(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_t_day ON targets(user_id, day);
@@ -102,6 +105,10 @@ def init_db():
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if "announcements" not in have:
             c.executescript(_SCHEMA_SQL)
+        elif "reports" not in have:
+            c.execute("""CREATE TABLE IF NOT EXISTS reports(
+              id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, body TEXT NOT NULL,
+              created_at TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0)""")
         msg_cols = {r[0] for r in c.execute(
             "SELECT name FROM pragma_table_info('messages')").fetchall()}
         if "hidden" not in msg_cols:
@@ -655,6 +662,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for r in rows:
                     d = rowdict(r); d["read"] = d["id"] in seen; out.append(d)
                 return self._send({"announcements": out})
+            if p == "/api/admin/reports":
+                if not self.is_admin(c, uid): return self._err("Admin only.", 403)
+                rows = c.execute("""SELECT r.id,r.body,r.created_at,r.resolved,r.user_id,u.name AS user_name
+                    FROM reports r LEFT JOIN users u ON u.id=r.user_id
+                    ORDER BY r.resolved ASC, r.id DESC LIMIT 100""").fetchall()
+                return self._send({"reports": [dict(r) for r in rows]})
             if p == "/api/admin/users":
                 if not self.is_admin(c, uid): return self._err("Admin only.", 403)
                 since = DAY_F(datetime.now(IST).date() - timedelta(days=7))
@@ -933,6 +946,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p.startswith("/api/announcements/") and p.endswith("/delete"):
                 return self.announcement_delete(c, uid, int(p.strip("/").split("/")[-2]))
             if p == "/api/admin/set-password": return self.admin_set_password(c, uid, body)
+            if p == "/api/report": return self.report_create(c, uid, body)
+            if p == "/api/admin/report/resolve": return self.report_resolve(c, uid, body)
             if p == "/api/account/wipe": return self.wipe(c, uid)
             return self._err("Not found", 404)
         finally:
@@ -1513,6 +1528,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def announcement_delete(self, c, uid, aid):
         if not self.is_admin(c, uid): return self._err("Only the admin can delete announcements.", 403)
         c.execute("DELETE FROM announcements WHERE id=?", (aid,)); c.commit()
+        return self._send({"ok": True})
+
+    # -------- user problem reports
+    def report_create(self, c, uid, body):
+        if not self._nonce_ok(c, uid, body): return
+        text = (body.get("body") or "").strip()
+        if not (5 <= len(text) <= 600): return self._err("Describe the problem in at least 5 characters (max 600).")
+        now = now_iso()
+        cur = c.execute("INSERT INTO reports(user_id,body,created_at,resolved) VALUES(?,?,?,0)", (uid, text, now))
+        c.commit()
+        result = {"ok": True, "id": cur.lastrowid}
+        self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
+        return self._send(result)
+
+    def report_resolve(self, c, uid, body):
+        if not self.is_admin(c, uid): return self._err("Admin only.", 403)
+        rid = body.get("id")
+        c.execute("UPDATE reports SET resolved=1 WHERE id=?", (rid,)); c.commit()
         return self._send({"ok": True})
 
     def admin_set_password(self, c, uid, body):
