@@ -1,10 +1,9 @@
 name: deploy-vercel
 
-# Every push to main uploads sources and builds on Vercel (clean cloud build
-# that honours .vercelignore). Secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+# Native Vercel Git integration handles deploys on every push (enabled in
+# Project Settings -> Git). This is a manual fallback only: dispatch it to
+# deploy from CI with the CLI.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
