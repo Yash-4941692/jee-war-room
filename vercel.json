@@ -1,6 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["bom1"],
+  "ignoreCommand": "git log -1 --pretty=%B | grep -qF '[skip deploy]' && exit 0 || exit 1",
   "functions": {
     "api/index.py": { "maxDuration": 10 }
   },

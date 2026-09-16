@@ -30,9 +30,7 @@ import dbwrap
 def db():
     return dbwrap.db()
 
-def init_db():
-    c = db()
-    c.executescript("""
+_SCHEMA_SQL = r"""
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
       pass_hash TEXT NOT NULL, salt TEXT NOT NULL, code TEXT UNIQUE NOT NULL,
@@ -84,7 +82,40 @@ def init_db():
     CREATE INDEX IF NOT EXISTS ix_t_day ON targets(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_mock_day ON mocks(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_err_day ON errors(user_id, day);
-    """)
+    """
+
+def init_db():
+    c = db()
+    if dbwrap.CLOUD:
+        # Serverless cold boots are frequent; the full idempotent DDL script
+        # below is ~15 round-trips. In the cloud run a 1-query schema check
+        # first and only execute the DDL when a new table is actually missing.
+        have = {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "announcements" not in have:
+            c.executescript(_SCHEMA_SQL)
+        msg_cols = {r[0] for r in c.execute(
+            "SELECT name FROM pragma_table_info('messages')").fetchall()}
+        if "hidden" not in msg_cols:
+            c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
+        user_cols = {r[0] for r in c.execute(
+            "SELECT name FROM pragma_table_info('users')").fetchall()}
+        if "role" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+            c.execute("UPDATE users SET role='admin' WHERE id=(SELECT MIN(id) FROM users)")
+        ch_cols = {r[0] for r in c.execute(
+            "SELECT name FROM pragma_table_info('chapters')").fetchall()}
+        if "lectures_total" not in ch_cols:
+            c.execute("ALTER TABLE chapters ADD COLUMN lectures_total INTEGER NOT NULL DEFAULT 0")
+        if "lectures_done" not in ch_cols:
+            c.execute("ALTER TABLE chapters ADD COLUMN lectures_done INTEGER NOT NULL DEFAULT 0")
+        c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
+            SELECT id, partner_id, created_at FROM users WHERE partner_id IS NOT NULL""")
+        c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
+            SELECT partner_id, id, created_at FROM users WHERE partner_id IS NOT NULL""")
+        c.commit(); c.close()
+        return
+    c.executescript(_SCHEMA_SQL)
     # ---- lightweight migrations ----
     def cols(tbl):
         return {r[1] for r in c.execute(f"PRAGMA table_info({tbl})")}
@@ -500,8 +531,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         u = urlparse(self.path); p = u.path; q = parse_qs(u.query)
         if p == "/healthz":
             try:
-                hc = db(); hc.execute("SELECT 1"); hc.close()
-                return self._send({"ok": True})
+                import time as _t, os as _os
+                t0 = _t.time()
+                hc = db()
+                t1 = _t.time()
+                hc.execute("SELECT 1").fetchone()
+                t2 = _t.time()
+                out = {"ok": True}
+                if q.get("detail"):
+                    out.update(connect_ms=int((t1 - t0) * 1000),
+                               query_ms=int((t2 - t1) * 1000),
+                               total_ms=int((t2 - t0) * 1000),
+                               region=_os.environ.get("VERCEL_REGION", "local"))
+                hc.close()
+                return self._send(out)
             except Exception as e:
                 return self._err("db unavailable: %s" % e, 503)
         if p.startswith("/api/"):
