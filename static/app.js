@@ -1809,9 +1809,13 @@ async function exportData(){
   a.download="jee-war-room-backup-"+today()+".json"; a.click();
 }
 async function wipeData(){
-  if(!confirm("This deletes ALL your activities, targets, XP, streaks and AIR history. Chapters reload fresh. Sure?"))return;
-  if(!confirm("Really reset everything? This cannot be undone."))return;
-  await api("/api/account/wipe",{}); toast("Reset complete"); state.stats={}; await refresh();
+  if(!confirm("This resets EVERYTHING for your account: all activities, targets, XP, streaks, AIR history AND syllabus chapter marks (61 chapters back to 'not started'). Friends and chat stay connected. Sure?"))return;
+  if(!confirm("Really reset? This cannot be undone."))return;
+  await api("/api/account/wipe",{}); toast("Reset complete");
+  // clear every client-side cache so wiped data (incl. syllabus) re-renders fresh
+  state.stats={}; state.chapters=null; state.targets=null; state.timer=null;
+  await refresh();
+  toast("Everything reset — syllabus included","good");
 }
 
 /* ============================================================ PUBLIC */
