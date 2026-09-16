@@ -5,7 +5,7 @@ name: keep-alive
 # Costs ~10 CI minutes/month on the free Actions allowance.
 on:
   schedule:
-    - cron: "11,41 * * * *"   # every 30 min (keeps function + DB warm)
+    - cron: "7,27,47 * * * *"   # every 20 min (keeps function + DB warm)
   workflow_dispatch:
 
 jobs:

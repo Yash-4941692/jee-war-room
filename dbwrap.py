@@ -145,10 +145,12 @@ class _Conn:
         self._inner = inner
 
     def _reconnect(self):
+        import time
         try: self._inner.close()
         except Exception: pass
         self._inner = _cloud_connect()
         _tls.inner = self._inner
+        _tls.last_used = time.time()
 
     @staticmethod
     def _attempt(inner, sql, params, many):
@@ -245,15 +247,26 @@ def _translate(sql):
 
 def db():
     """Open a database connection (one per request, same as the original app).
-    In cloud mode the underlying client is reused across requests per thread."""
+    In cloud mode the underlying client is reused across requests per thread,
+    but a serverless freeze can leave the cached Hrana socket half-dead: the
+    first query after that hangs for ~10 s before erroring. If this worker has
+    been idle for more than 20 s, replace the client up front (one fast
+    handshake, ~0.3 s same-region) instead of paying the hang on a user request."""
     if not CLOUD:
         c = sqlite3.connect(DB_PATH, timeout=30)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA foreign_keys=ON")
         return c
+    import time
     inner = getattr(_tls, "inner", None)
+    last = getattr(_tls, "last_used", 0.0)
+    if inner is not None and (time.time() - last) > 20:
+        try: inner.close()
+        except Exception: pass
+        inner = None
     if inner is None:
         inner = _cloud_connect()
         _tls.inner = inner
+    _tls.last_used = time.time()
     return _Conn(inner)
