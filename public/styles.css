@@ -701,3 +701,14 @@ html,body{overflow-x:hidden}
 .rep-done{opacity:.5}
 #report-sent{min-height:14px}
 #adm-loading{padding:6px 0}
+
+/* ===== v15: scroll must always work ===== */
+.view.no-anim > *{animation:none !important}
+#toast-root{pointer-events:none}
+#toast-root .toast{pointer-events:auto}
+.msg-body{touch-action:pan-y;overscroll-behavior:contain}
+.modal{touch-action:pan-y}
+@media(max-width:760px){
+  .chat-pane{min-height:0}
+  .msg-body{max-height:64vh;-webkit-overflow-scrolling:touch;touch-action:pan-y}
+}

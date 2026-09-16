@@ -23,7 +23,7 @@ const state = {
   me:null, friends:[], chapters:null, targets:[], announcements:[],
   view:"home", stats:{}, airDetail:null,
   wz:null, tmr:null, tmrTick:null,
-  duelUid:null, chatOpen:null, chatMsgs:[], chatPoll:null, threads:[], chatPending:{}, chatCache:{},
+  duelUid:null, chatOpen:null, chatMsgs:[], chatPoll:null, threads:[], chatPending:{}, chatCache:{}, chatCleared:{},
 };
 const isAdmin = () => !!(state.me && state.me.user && state.me.user.role === "admin");
 const friendByUid = uid => state.friends.find(f=>f.uid===uid) || null;
@@ -268,9 +268,15 @@ async function enterApp(){
 }
 
 /* automatic live sync — no manual reload needed */
-let liveTimer=null, liveBusy=false;
+let liveTimer=null, liveBusy=false, lastInteraction=0;
 function startLiveSync(){
   if(liveTimer) return;
+  // passive: remember when the user is actively touching/scrolling so a
+  // background refresh never yanks the screen out from under their thumb.
+  const poke=()=>{ lastInteraction=Date.now(); };
+  window.addEventListener("scroll",poke,{passive:true,capture:true});
+  window.addEventListener("touchmove",poke,{passive:true,capture:true});
+  window.addEventListener("pointerdown",poke,{passive:true});
   document.addEventListener("visibilitychange",()=>{ if(!document.hidden && state.me) liveTick(); });
   window.addEventListener("pageshow",()=>{ if(state.me) liveTick(); });
   liveTimer=setInterval(()=>{ if(!document.hidden && state.me && !document.querySelector(".overlay")) liveTick(); },90000);
@@ -279,8 +285,9 @@ async function liveTick(){
   if(liveBusy) return; liveBusy=true;
   try{
     await reloadMe(); buildNav();
-    if(state.view==="chat"){ refreshThreads(); }
-    else if(["home","today","jee","duel"].includes(state.view)){ render(true); }
+    const idle=Date.now()-lastInteraction>2500;
+    if(state.view==="chat"){ if(idle) refreshThreads(); }
+    else if(idle && ["home","today","jee","duel"].includes(state.view)){ render(true); }
   }catch(e){ /* silent background sync */ }
   finally{ liveBusy=false; }
 }
@@ -290,7 +297,7 @@ async function reloadMe(silent){
   // parallel: one round-trip instead of two sequential ones
   const [me] = await Promise.all([
     api("/api/me"),
-    api("/api/friends").then(d=>{ state.friends=d.friends||[]; }).catch(()=>{ state.friends=[]; })
+    api("/api/friends").then(d=>{ state.friends=d.friends||[]; fire(prefetchThreads); }).catch(()=>{ state.friends=[]; })
   ]);
   state.me = me;
 }
@@ -331,6 +338,7 @@ function route(){
   state.view = (location.hash||"#/home").slice(2).split("?")[0] || "home";
   if(!NAV.find(n=>n.id===state.view)) state.view="home";
   if(!state.me) return; // boot still loading; enterApp() will route once data is ready
+  closeModal();           // never leave a fixed overlay behind (it freezes page scroll)
   stopChatPoll();
   if(state.view!=="chat"){ state.chatOpen=null; }
   buildNav(); render();
@@ -340,7 +348,15 @@ window.addEventListener("hashchange", route);
 function render(keepScroll){
   const v=$("#view"); if(!state.me){return;}
   const sy=window.scrollY;
-  const restore=()=>{ if(keepScroll) requestAnimationFrame(()=>window.scrollTo({top:sy,behavior:"instant"})); };
+  // Background refreshes must NOT replay entrance animations or fight the
+  // user's scroll. Suppress animations, swap content, put scroll exactly back.
+  if(keepScroll) v.classList.add("no-anim");
+  const restore=()=>{
+    if(!keepScroll) return;
+    const put=()=>{ if(window.scrollY!==sy) window.scrollTo(0,sy); };
+    requestAnimationFrame(put); requestAnimationFrame(put); setTimeout(put,60);
+    setTimeout(()=>v.classList.remove("no-anim"),150);
+  };
   if(state.view==="home"){ v.innerHTML=viewHome(); restore(); }
   else if(state.view==="today"){ renderToday().then(restore); }
   else if(state.view==="jee"){ renderJee(); restore(); }
@@ -1298,9 +1314,11 @@ async function connectDuel(){
 
 /* ============================================================ CHAT */
 function openChat(uid){
-  if(state.chatOpen!==uid){ state.chatMsgs=[]; }
   state.chatOpen=uid;
-  if(state.view!=="chat"){ go("chat"); } else { renderChat(); }
+  delete state.chatCleared[uid];
+  // seed from cache SYNCHRONOUSLY so the pane can paint instantly, zero await
+  state.chatMsgs=(state.chatCache[uid]||[]).slice();
+  if(state.view!=="chat"){ go("chat"); } else { showThread(); refreshThreads(); }
 }
 function chatBack(){ state.chatOpen=null; renderChat(); }
 async function clearChat(uid){
@@ -1310,6 +1328,7 @@ async function clearChat(uid){
     await api("/api/messages/clear",{with:uid});
     if(state.chatOpen===uid){ state.chatMsgs=[]; state.chatPending[uid]=[]; }
     delete state.chatCache[uid];
+    state.chatCleared[uid]=true;
     const th=(state.threads||[]).find(t=>t.uid===uid); if(th){ th.last=null; th.unread=0; }
     if(state.view==="chat") renderChat();
     toast("Chat deleted from your device","good");
@@ -1327,22 +1346,54 @@ async function renderChat(){
     return;
   }
   if(!state.chatOpen || !friendByUid(state.chatOpen)) state.chatOpen=null;
-  v.innerHTML=`<div class="chat-shell">
-    <div class="chat-list ${state.chatOpen?'hidden-mobile':''}" id="chat-list">${chatListHTML()}</div>
-    <div class="chat-pane ${state.chatOpen?'':'hidden-mobile'}" id="chat-pane">${state.chatOpen?"<div class='empty'>Loading…</div>":`<div class="empty"><span class="e">💬</span>Pick a buddy to message.</div>`}</div>
-  </div>`;
-  // shell is already on screen; show cached conversation INSTANTLY, then refresh in background
-  if(state.chatOpen){
-    const cached=state.chatCache[state.chatOpen];
-    if(cached && cached.length){
-      state.chatMsgs=cached.slice();
-      const pane0=document.getElementById("chat-pane");
-      if(pane0){ pane0.innerHTML=chatPaneHTML(friendByUid(state.chatOpen),state.chatMsgs);
-        const bd=pane0.querySelector(".msg-body"); if(bd) bd.scrollTop=bd.scrollHeight; }
-    }
-    loadThread(true).then(ok=>{ if(ok!==false){ state.chatCache[state.chatOpen]=state.chatMsgs; startChatPoll(); } });
-    refreshThreads();
-  } else { refreshThreads(); }
+  // Build the shell only once; switching buddies only swaps the pane (no full rebuild).
+  if(!document.querySelector(".chat-shell")){
+    v.innerHTML=`<div class="chat-shell">
+      <div class="chat-list ${state.chatOpen?'hidden-mobile':''}" id="chat-list">${chatListHTML()}</div>
+      <div class="chat-pane ${state.chatOpen?'':'hidden-mobile'}" id="chat-pane"></div>
+    </div>`;
+  }
+  showThread();
+  refreshThreads();
+  prefetchThreads();   // warm every conversation in the background so first tap is instant
+}
+/* Paints the currently-open buddy's pane from cache, then syncs in the background. */
+function showThread(){
+  const pane=document.getElementById("chat-pane"); if(!pane) return;
+  const listEl=document.getElementById("chat-list");
+  if(listEl){ listEl.classList.toggle("hidden-mobile", !!state.chatOpen); }
+  pane.classList.toggle("hidden-mobile", !state.chatOpen);
+  if(!state.chatOpen){
+    pane.innerHTML=`<div class="empty"><span class="e">💬</span>Pick a buddy to message.</div>`;
+    return;
+  }
+  const f=friendByUid(state.chatOpen);
+  const cached=state.chatCache[state.chatOpen];
+  state.chatMsgs=(cached||[]).slice();
+  if(cached){
+    pane.innerHTML=chatPaneHTML(f,state.chatMsgs);
+    const bd=pane.querySelector(".msg-body"); if(bd) bd.scrollTop=bd.scrollHeight;
+    const inp=pane.querySelector("#chat-text"); if(inp) inp.focus({preventScroll:true});
+  }else{
+    pane.innerHTML=`<div class="empty">Loading…</div>`;
+  }
+  // background sync (incremental if cached, full if not); never blocks the paint
+  loadThread(true).then(ok=>{ if(ok!==false){ state.chatCache[state.chatOpen]=state.chatMsgs; startChatPoll(); } });
+}
+/* Quietly loads EVERY buddy's conversation once, in series, so tapping any chat
+   is instant. Does NOT mark messages read (unread badges stay correct). */
+async function prefetchThreads(){
+  for(const f of state.friends){
+    if(state.chatCache[f.uid]) continue;
+    if(state.chatCleared[f.uid]) continue;        // user deleted their copy
+    if(state.chatOpen===f.uid) continue;          // the open one syncs itself
+    try{
+      const d=await api(`/api/messages?with=${f.uid}&after=0`);
+      if(state.chatOpen===f.uid) continue;   // it's open now; its own sync owns the cache
+      state.chatCache[f.uid]=d.messages||[];
+    }catch(e){ /* leave it; it loads on tap */ }
+    await new Promise(r=>setTimeout(r,150));      // gentle on a waking database
+  }
 }
 function chatListHTML(){
   const list=state.friends;
@@ -1363,10 +1414,8 @@ async function refreshThreads(){
     state.threads=d.threads||[];
     // unread badges from the thread payload (no heavy /api/friends refetch)
     for(const t of state.threads){ const f=state.friends.find(x=>x.uid===t.uid); if(f) f.unread=t.unread; }
-    if(!state.chatOpen){
-      const box=document.querySelector("#chat-list"); if(box) box.innerHTML=chatListHTML();
-      buildNav();
-    }
+    const box=document.querySelector("#chat-list"); if(box) box.innerHTML=chatListHTML();
+    buildNav();
   }catch(e){}
 }
 function chatBubbleHTML(m){
@@ -1382,15 +1431,22 @@ async function loadThread(mark){
   catch(e){ if(mark===true){ const p0=document.getElementById("chat-pane");
     if(p0 && state.chatOpen===uid) p0.innerHTML=`<div class="empty"><span class="e">📡</span>Slow connection — messages didn't load.<br><button class="btn-primary" style="margin-top:10px" onclick="App.loadThread(true)">RETRY</button></div>`; }
     return false; }
+  if(state.chatOpen!==uid) return false;   // user switched away mid-request
   const incoming=d.messages||[];
   const full=(mark===true);
-  if(full) state.chatMsgs=incoming;
-  else state.chatMsgs=state.chatMsgs.concat(incoming);
+  if(full && after===0){
+    state.chatMsgs=incoming;                                  // cold load: replace
+  }else{
+    const have=new Set(state.chatMsgs.map(m=>m.id));         // cached/poll: MERGE, never wipe
+    for(const m of incoming) if(!have.has(m.id)) state.chatMsgs.push(m);
+    state.chatMsgs.sort((a,b)=>a.id-b.id);
+  }
   if(mark || incoming.some(m=>!m.mine)) api("/api/messages/read",{with:uid}).catch(()=>{});
   f.unread=0;
   const pane=document.getElementById("chat-pane");
   if(!pane||state.chatOpen!==uid) return;
-  if(full){
+  const bodyHasEmpty=pane.querySelector(".msg-body .empty")||!pane.querySelector(".msg-body");
+  if(full && (after===0 || bodyHasEmpty)){
     pane.innerHTML=chatPaneHTML(f,state.chatMsgs);
     const body=pane.querySelector(".msg-body"); if(body) body.scrollTop=body.scrollHeight;
     const inp=pane.querySelector("#chat-text"); if(inp && mark) inp.focus({preventScroll:true});
