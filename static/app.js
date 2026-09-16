@@ -51,12 +51,21 @@ async function api(path, body){
   const opt = {method:"GET", headers:{}, credentials:"same-origin"};
   const tok = getToken(); if(tok) opt.headers["Authorization"] = "Bearer " + tok;
   if(body !== undefined){ opt.method="POST"; opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
-  // Never hang forever on a cold database wake; the chat poller backs off and retries.
-  opt.signal = AbortSignal.timeout(18000);
+  // Never hang forever on a cold database wake; GETs transparently retry once
+  // (a cold Turso wake can take ~15-20s; by the retry it is warm).
+  opt.signal = AbortSignal.timeout(body===undefined ? 15000 : 20000);
   let r;
   try{ r = await fetch(path, opt); }
-  catch(e){ setOffline(true);
-    throw new Error(e.name==="TimeoutError" ? "Server is waking up — retrying…" : "No connection — the server is temporarily unreachable."); }
+  catch(e){
+    if(body===undefined && e.name==="TimeoutError"){
+      await new Promise(res=>setTimeout(res,2500));
+      try{ r = await fetch(path, {...opt, signal:AbortSignal.timeout(25000)}); }
+      catch(e2){ setOffline(true); throw new Error("Server is warming up — please retry in a few seconds."); }
+    } else {
+      setOffline(true);
+      throw new Error("No connection — the server is temporarily unreachable.");
+    }
+  }
   setOffline(false);
   let d = {}; try{ d = await r.json(); }catch(e){}
   if(r.status === 401 && !path.includes("/auth/")){
