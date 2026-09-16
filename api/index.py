@@ -18,33 +18,31 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Background maintenance on each warm serverless instance:
-#  1) self-healing schema (idempotent, never touches data)
-#  2) a SELECT 1 every 4 minutes keeps the Turso database awake, so a visitor
-#     never pays the suspended-database wake-up. The thread pauses when the
-#     platform freezes the instance and immediately re-warms on thaw (wall
-#     clock jump makes the interval check fire before the first new request).
-def _bg_init():
+# Self-healing schema MUST run synchronously at cold import: serverless
+# freezes the instance the moment the first response finishes, so a daemon
+# thread started here may be paused mid-way and never complete. The cloud path
+# is a single 1-query table check (~0.1s same-region); it only runs DDL when a
+# genuinely new table is missing. Wrapped so schema maintenance can never take
+# a request down.
+try:
+    server.init_db()
+except Exception as _e:
+    print("init_db warning:", _e)
+
+# Background warmer (schema is already handled above): a SELECT 1 every 4 min
+# keeps the Turso database awake while this instance is warm.
+def _warm_loop():
     import time
-    try:
-        server.init_db()
-    except Exception as _e:
-        print("init_db warning:", _e)
     while True:
         time.sleep(240)
         try:
             c = server.db()
             c.execute("SELECT 1").fetchone()
             c.close()
-        except Exception as _e:
-            print("warmer warning:", _e)
+        except Exception:
             time.sleep(5)
-            try:
-                server.init_db()   # recreate a dead client
-            except Exception:
-                pass
 
-threading.Thread(target=_bg_init, daemon=True).start()
+threading.Thread(target=_warm_loop, daemon=True).start()
 
 
 class handler(server.Handler):
