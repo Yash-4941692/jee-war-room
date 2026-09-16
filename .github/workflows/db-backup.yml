@@ -1,0 +1,36 @@
+name: db-backup
+
+# Weekly safety dump of the Turso database committed to this PRIVATE repo.
+# Requires repository secrets TURSO_DATABASE_URL and TURSO_AUTH_TOKEN
+# (the same values given to Koyeb).
+on:
+  schedule:
+    - cron: "37 3 * * 1"   # Mondays 03:37 UTC
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install client
+        run: pip install libsql==0.1.11
+      - name: Dump database to SQL
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: |
+          mkdir -p backups
+          python tools/turso_io.py dump backups/warroom-dump.sql
+      - name: Commit dump
+        run: |
+          git config user.name "db-backup-bot"
+          git config user.email "db-backup-bot@users.noreply.github.com"
+          git add backups/
+          git commit -m "chore: weekly database dump" || echo "no changes"
+          git push

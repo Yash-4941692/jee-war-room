@@ -1,0 +1,8 @@
+# live database, backups and logs never go to git (data lives in Turso cloud)
+data/
+__pycache__/
+*.pyc
+.env
+*.log
+# tunnel credentials / machine-local deploy secrets
+deploy/
