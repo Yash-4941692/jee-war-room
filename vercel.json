@@ -3,22 +3,6 @@
   "functions": {
     "api/index.py": { "maxDuration": 10 }
   },
-  "outputFileTracingExcludes": {
-    "**/*": [
-      "data/**",
-      "deploy/**",
-      "tools/**",
-      ".github/**",
-      ".vercel/**",
-      "guardian.sh",
-      "supervise.sh",
-      "ngrok.sh",
-      "Dockerfile",
-      ".dockerignore",
-      "STATUS.md",
-      "DEPLOY.md"
-    ]
-  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index?__path=/$1" }
   ]
