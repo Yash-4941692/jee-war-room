@@ -35,6 +35,12 @@ _tls = threading.local()
 # Watchdog pool: libsql native calls release the GIL while waiting on IO, so a
 # future thread can enforce the deadline even when the call itself never would.
 _pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="dbio")
+# Cold database wake-up is serialized per worker: when a suspended Turso
+# database is waking, concurrent requests wait for the FIRST connection rather
+# than each opening their own and prolonging the wake (the old 4 s chat poll
+# used to pile ~15 connections onto a waking DB).
+_connect_lock = threading.Lock()
+_last_wake = [0.0]   # epoch of the last successful cold-wake (1-element "cell")
 
 
 def _cloud_connect():
@@ -46,21 +52,35 @@ def _cloud_connect():
 
 
 def _fresh_after_connect(deadline=None):
-    """New clients may need a moment (e.g. waking a suspended database);
-    pinging here keeps the hang in a reconnect we can retry rather than in the
-    caller's statement."""
+    """Create a client and verify it with SELECT 1. Serialized by a process
+    lock so one waking database is only opened once per worker; threads that
+    arrive while a wake is in progress wait (briefly) for the shared client."""
     import time
-    inner = _cloud_connect()
-    f = _pool.submit(inner.execute, "SELECT 1")
-    try:
-        f.result(timeout=deadline or (DB_TIMEOUT + 7))
-    except Exception:
-        try: inner.close()
-        except Exception: pass
-        raise
-    _tls.inner = inner
-    _tls.last_used = time.time()
-    return inner
+    # Fast path: another thread already finished the wake.
+    existing = getattr(_tls, "inner", None)
+    if existing is not None:
+        return existing
+    with _connect_lock:
+        existing = getattr(_tls, "inner", None)
+        if existing is not None:
+            return existing
+        # A sibling thread may have woken the database seconds ago; then our
+        # own connect will be quick and doesn't need the long wake deadline.
+        woke = _last_wake[0]
+        wait_deadline = DB_TIMEOUT if (time.time() - woke) < 30 else (deadline or (DB_TIMEOUT + 18))
+        inner = _cloud_connect()
+        f = _pool.submit(inner.execute, "SELECT 1")
+        try:
+            # suspended databases can take ~20-30 s to wake the first time
+            f.result(timeout=wait_deadline)
+        except Exception:
+            try: inner.close()
+            except Exception: pass
+            raise
+        _tls.inner = inner
+        _tls.last_used = time.time()
+        _last_wake[0] = time.time()
+        return inner
 
 _READ_OK = ("SELECT", "PRAGMA", "WITH", "CREATE", "INSERT OR REPLACE", "INSERT OR IGNORE")
 def _is_safe_to_retry(sql):

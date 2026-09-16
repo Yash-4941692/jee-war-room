@@ -51,9 +51,12 @@ async function api(path, body){
   const opt = {method:"GET", headers:{}, credentials:"same-origin"};
   const tok = getToken(); if(tok) opt.headers["Authorization"] = "Bearer " + tok;
   if(body !== undefined){ opt.method="POST"; opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
+  // Never hang forever on a cold database wake; the chat poller backs off and retries.
+  opt.signal = AbortSignal.timeout(18000);
   let r;
   try{ r = await fetch(path, opt); }
-  catch(e){ setOffline(true); throw new Error("No connection — the server is temporarily unreachable."); }
+  catch(e){ setOffline(true);
+    throw new Error(e.name==="TimeoutError" ? "Server is waking up — retrying…" : "No connection — the server is temporarily unreachable."); }
   setOffline(false);
   let d = {}; try{ d = await r.json(); }catch(e){}
   if(r.status === 401 && !path.includes("/auth/")){
@@ -207,8 +210,12 @@ async function connectAfter(){
 }
 async function enterApp(){
   try{
-    if(!state.me) await reloadMe(true);
-    try{ await loadChapters(true); }catch(e){}
+    if(!state.me){
+      await Promise.all([
+        reloadMe(true),
+        loadChapters(true).catch(()=>{})
+      ]);
+    } else { try{ await loadChapters(true); }catch(e){} }
   }catch(e){ showAuth(); return; }
   $("#boot").classList.add("hidden"); $("#auth").classList.add("hidden");
   $("#auth-form").classList.remove("hidden"); $("#auth-after").classList.add("hidden");
@@ -238,14 +245,22 @@ async function liveTick(){
 async function logout(){ if(!confirm("Log out?"))return; try{ await api("/api/auth/logout",{}); }catch(e){} setToken(""); location.reload(); }
 
 async function reloadMe(silent){
-  state.me = await api("/api/me");
-  try{ state.friends = (await api("/api/friends")).friends || []; }catch(e){ state.friends=[]; }
+  // parallel: one round-trip instead of two sequential ones
+  const [me] = await Promise.all([
+    api("/api/me"),
+    api("/api/friends").then(d=>{ state.friends=d.friends||[]; }).catch(()=>{ state.friends=[]; })
+  ]);
+  state.me = me;
 }
 async function refresh(renderAgain=true){
-  await reloadMe();
-  try{ await loadChapters(false); }catch(e){}
-  try{ state.announcements=(await api("/api/announcements")).announcements||[]; }catch(e){}
-  if(state.view==="today") await loadTargets();
+  // fire every startup load at once (me, friends, chapters, announcements…)
+  const jobs=[
+    reloadMe(),
+    loadChapters(false).catch(()=>{}),
+    api("/api/announcements").then(d=>{ state.announcements=d.announcements||[]; }).catch(()=>{}),
+  ];
+  if(state.view==="today") jobs.push(loadTargets().catch(()=>{}));
+  await Promise.all(jobs);
   if(renderAgain) render();
 }
 
@@ -1196,7 +1211,6 @@ async function connectDuel(){
 }
 
 /* ============================================================ CHAT */
-function stopChatPoll(){ if(state.chatPoll){ clearInterval(state.chatPoll); state.chatPoll=null; } }
 function openChat(uid){
   if(state.chatOpen!==uid){ state.chatMsgs=[]; }
   state.chatOpen=uid;
@@ -1263,14 +1277,14 @@ function chatBubbleHTML(m){
     <div class="bubble">${esc(m.body).replace(/\n/g,"<br>")}<span class="msg-time">${fmtTime(m.at)}</span></div></div>`;
 }
 async function loadThread(mark){
-  const uid=state.chatOpen; if(!uid) return;
-  const f=friendByUid(uid); if(!f) return;
+  const uid=state.chatOpen; if(!uid) return true;
+  const f=friendByUid(uid); if(!f) return true;
   const after = state.chatMsgs.length?state.chatMsgs[state.chatMsgs.length-1].id:0;
   let d;
   try{ d=await api(`/api/messages?with=${uid}&after=${after}`); }
   catch(e){ if(mark===true){ const p0=document.getElementById("chat-pane");
     if(p0 && state.chatOpen===uid) p0.innerHTML=`<div class="empty"><span class="e">📡</span>Slow connection — messages didn't load.<br><button class="btn-primary" style="margin-top:10px" onclick="App.loadThread(true)">RETRY</button></div>`; }
-    return; }
+    return false; }
   const incoming=d.messages||[];
   const full=(mark===true);
   if(full) state.chatMsgs=incoming;
@@ -1291,6 +1305,7 @@ async function loadThread(mark){
       if(nearBottom) body.scrollTop=body.scrollHeight; }
   }
   buildNav();
+  return true;
 }
 function pendingBubbleHTML(uid,p){
   const click=p.status==='failed'?` onclick="App.retryChat('${p.temp}')" style="cursor:pointer"`:"";
@@ -1317,14 +1332,21 @@ function chatPaneHTML(f,msgs){
 }
 function startChatPoll(){
   stopChatPoll();
-  let ticks=0;
-  state.chatPoll=setInterval(async()=>{
+  let ticks=0, fails=0;
+  const tick=async()=>{
     if(state.view!=="chat"||!state.chatOpen){ stopChatPoll(); return; }
-    await loadThread(false);
+    const ok=await loadThread(false);
     ticks++;
-    if(ticks%3===0) await refreshThreads();
-  },4000);
+    if(ok && ticks%3===0) await refreshThreads();
+    // While the server/database is waking, back off 4s→8→16→30s so an open
+    // chat tab doesn't pile requests onto a cold server (which delays wake).
+    fails = ok ? 0 : Math.min(fails+1, 4);
+    const delay = ok ? 4000 : [8000,16000,30000,30000][fails-1] || 30000;
+    state.chatPoll=setTimeout(tick, delay);
+  };
+  state.chatPoll=setTimeout(tick, 4000);
 }
+function stopChatPoll(){ if(state.chatPoll){ clearTimeout(state.chatPoll); state.chatPoll=null; } }
 function nowISO(){ const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,19); }
 function chatDeliver(to,item){
   const node=document.querySelector(`[data-pending="${item.temp}"]`);
