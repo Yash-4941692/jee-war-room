@@ -18,15 +18,31 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Self-healing schema: idempotent CREATE TABLE IF NOT EXISTS + column
-# migrations. Runs in a BACKGROUND daemon thread so a cold/slow database can
-# never stall the function's import (that stall was the ~300s cold hangs).
-# Schema already exists in production; requests don't wait on this.
+# Background maintenance on each warm serverless instance:
+#  1) self-healing schema (idempotent, never touches data)
+#  2) a SELECT 1 every 4 minutes keeps the Turso database awake, so a visitor
+#     never pays the suspended-database wake-up. The thread pauses when the
+#     platform freezes the instance and immediately re-warms on thaw (wall
+#     clock jump makes the interval check fire before the first new request).
 def _bg_init():
+    import time
     try:
         server.init_db()
     except Exception as _e:
         print("init_db warning:", _e)
+    while True:
+        time.sleep(240)
+        try:
+            c = server.db()
+            c.execute("SELECT 1").fetchone()
+            c.close()
+        except Exception as _e:
+            print("warmer warning:", _e)
+            time.sleep(5)
+            try:
+                server.init_db()   # recreate a dead client
+            except Exception:
+                pass
 
 threading.Thread(target=_bg_init, daemon=True).start()
 
