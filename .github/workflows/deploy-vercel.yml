@@ -1,8 +1,7 @@
 name: deploy-vercel
 
-# Every push to main builds and deploys production on Vercel using the
-# documented non-interactive CI sequence (pull -> build -> prebuilt deploy).
-# Secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+# Every push to main uploads sources and builds on Vercel (clean cloud build
+# that honours .vercelignore). Secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
 on:
   push:
     branches: [main]
@@ -16,28 +15,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install Vercel CLI + uv (Python build backend)
-        run: |
-          npm install --global vercel@latest
-          pip install --quiet uv
-      - name: Pull Vercel environment settings
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+      - name: Deploy to production (cloud build)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
-      - name: Build production output
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel build --prod --token="$VERCEL_TOKEN"
-      - name: Deploy prebuilt output
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: vercel deploy --prebuilt --prod --yes --archive=tgz --token="$VERCEL_TOKEN"
+        run: vercel deploy --prod --yes --token="$VERCEL_TOKEN"
