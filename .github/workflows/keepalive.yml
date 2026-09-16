@@ -1,11 +1,11 @@
 name: keep-alive
 
-# Keeps the free Hugging Face Space awake (it would otherwise sleep after
-# 48h with zero visitors) and keeps the Turso database connection warm.
-# Costs ~10 CI minutes/month on the free Actions allowance.
+# Keeps the serverless function warm (faster first response) and the Turso
+# database active. Runs every 10 minutes (~4,400 pings/month, far inside the
+# 1M free function invocations and Actions allowances).
 on:
   schedule:
-    - cron: "13 * * * *"   # every hour at :13
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -16,23 +16,23 @@ jobs:
         env:
           APP_URL: ${{ vars.APP_URL }}
         run: |
-          if [ -z "$APP_URL" ]; then echo "APP_URL repository variable not set yet — skipping"; exit 0; fi
+          if [ -z "$APP_URL" ]; then echo "APP_URL not set yet — skipping"; exit 0; fi
           echo "Pinging $APP_URL/healthz"
-          curl -fsS --max-time 120 "$APP_URL/healthz"
-          echo " -> healthy"
+          curl -fsS --max-time 60 "$APP_URL/healthz" && echo " -> healthy"
 
-  # GitHub disables scheduled workflows after ~60 days without repository
-  # activity. This weekly commit keeps the repository "active" forever.
   touch:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
       - uses: actions/checkout@v4
-      - name: Weekly activity commit
+      - name: Weekly activity commit (keeps scheduled workflows enabled)
         run: |
-          date -u +%FT%TZ >> .keepalive-log
-          git config user.name "keepalive-bot"
-          git config user.email "keepalive-bot@users.noreply.github.com"
-          git add .keepalive-log
-          git commit -m "chore: scheduled keepalive touch" || echo "nothing to commit"
-          git push || true
+          WEEK=$(date -u +%G-W%V)
+          if [ "$(date -u +%u)" = "1" ]; then
+            echo "$(date -u +%FT%TZ) week $WEEK" >> .keepalive-log
+            git config user.name "keepalive-bot"
+            git config user.email "keepalive-bot@users.noreply.github.com"
+            git add .keepalive-log
+            git commit -m "chore: keepalive touch $WEEK" || echo "nothing to commit"
+            git push || true
+          fi

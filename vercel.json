@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "regions": ["bom1"],
+  "rewrites": [
+    { "source": "/healthz", "destination": "/api/index" },
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/((?!app\\.js|styles\\.css|favicon).*)", "destination": "/api/index" }
+  ]
+}

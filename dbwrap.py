@@ -6,7 +6,7 @@ Database adapter for JEE WAR ROOM.
   wire protocol). The app's SQL is unchanged; this wrapper only restores the
   sqlite3.Row access style (rows by column name) that the app relies on.
 """
-import os, re, sqlite3
+import os, re, sqlite3, threading
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
@@ -134,9 +134,16 @@ class _Conn:
         self._inner.commit()
 
     def rollback(self):
-        self._inner.rollback()
+        try:
+            self._inner.rollback()
+        except Exception:
+            pass
 
     def close(self):
+        # In cloud/serverless mode the connection is a process-wide warm pool
+        # (libsql speaks stateless HTTPS). Don't tear it down per request.
+        if CLOUD:
+            return
         try:
             self._inner.close()
         except Exception:
@@ -180,8 +187,17 @@ def _translate(sql):
     return sql
 
 
+_CLOUD_LOCK = threading.Lock()
+_CLOUD_CONN = None
+
 def db():
-    """Open a database connection (one per request, same as the original app)."""
+    """Open a database connection.
+
+    Local mode: a fresh SQLite file connection (threaded server).
+    Cloud mode: one shared warm libsql connection per process (fast across
+    serverless invocations; close() is a no-op so the pool survives requests).
+    """
+    global _CLOUD_CONN
     if not CLOUD:
         c = sqlite3.connect(DB_PATH, timeout=30)
         c.row_factory = sqlite3.Row
@@ -189,8 +205,11 @@ def db():
         c.execute("PRAGMA foreign_keys=ON")
         return c
     import libsql
-    inner = libsql.connect(
-        TURSO_URL, auth_token=TURSO_TOKEN,
-        _check_same_thread=False, timeout=30,
-    )
-    return _Conn(inner)
+    with _CLOUD_LOCK:
+        if _CLOUD_CONN is None:
+            inner = libsql.connect(
+                TURSO_URL, auth_token=TURSO_TOKEN,
+                _check_same_thread=False, timeout=30,
+            )
+            _CLOUD_CONN = _Conn(inner)
+        return _CLOUD_CONN

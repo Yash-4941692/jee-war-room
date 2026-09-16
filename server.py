@@ -861,13 +861,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             uid = cur.lastrowid
             s = default_settings(); s["sweepDay"] = TODAY()
             save_settings(c, uid, s)
-            # preload chapters (idempotent guard)
+            # preload chapters (idempotent guard; single batched round-trip)
             if not c.execute("SELECT 1 FROM chapters WHERE user_id=? LIMIT 1", (uid,)).fetchone():
+                rows = []
                 n = 0
                 for subj in SUBJECTS:
                     for ch in SYL.CHAPTERS[subj]:
-                        c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)",
-                                  (uid, subj, ch, "not_started", n)); n += 1
+                        rows.append((uid, subj, ch, "not_started", n)); n += 1
+                c.executemany("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", rows)
             # seed starting snapshot
             c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
             c.commit()
@@ -1525,10 +1526,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
         s = default_settings(); s["sweepDay"] = TODAY()
         save_settings(c, uid, s)
-        n = 0
+        rows, n = [], 0
         for subj in SUBJECTS:
             for ch in SYL.CHAPTERS[subj]:
-                c.execute("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", (uid, subj, ch, "not_started", n)); n += 1
+                rows.append((uid, subj, ch, "not_started", n)); n += 1
+        c.executemany("INSERT INTO chapters(user_id,subject,name,status,sort) VALUES(?,?,?,?,?)", rows)
         c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
         c.commit()
         return self._send({"ok": True})
