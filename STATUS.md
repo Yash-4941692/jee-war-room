@@ -42,7 +42,26 @@
   POST /api/announcements/read; POST /api/announcements/<id>/delete (admin);
   GET /api/admin/users (admin); POST /api/admin/set-password (admin);
   POST /api/messages/clear (per-user chat clear). api/index.py runs idempotent
-  init_db() on cold start so new tables self-create on Turso.
+  init_db() on cold start (background daemon thread since v8.3) so new tables
+  self-create on Turso without stalling a cold boot.
+- v8.1–v8.3 cold-start hardening (fixed intermittent 12–300 s hangs after idle):
+  * DB URL uses stateless `https://` Hrana (no half-open WebSocket after freeze)
+  * dbwrap: per-thread cached client replaced after 20 s idle; EVERY remote
+    statement runs under a 7 s watchdog (fresh connect allowed ~14 s for a
+    waking DB); poisoned clients are abandoned; reads retry once, writes fail
+    fast (nonce-protected POSTs can safely resend)
+  * cloud cold boot does a 1-query schema check, not the full DDL script
+  * `/healthz?detail=1` reports connect_ms/query_ms/region for diagnosis
+  * keepalive every 10 min with retry-through-wake loop
+- Git/Vercel: GitHub repo IS connected (Settings→Git done 2026-09-16); pushes to
+  main auto-deploy in ~15-30 s, atomically. Commits MUST be authored as
+  Yash's GitHub identity or Vercel blocks the deployment:
+  `git config user.email 304053128+Yash-4941692@users.noreply.github.com`
+  (name Yash-4941692). vercel.json ignoreCommand cancels builds for commits
+  containing `[skip deploy]` (used by the weekly db-backup bot commit).
+- CLI zero-downtime alternative still works: `vercel deploy` (preview, env
+  vars exist for production+preview; SSO protection is OFF) then
+  `vercel alias set <preview> jee-war-room-three.vercel.app`.
 
 ## Accounts / data
 
