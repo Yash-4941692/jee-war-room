@@ -51,23 +51,32 @@ async function api(path, body){
   const opt = {method:"GET", headers:{}, credentials:"same-origin"};
   const tok = getToken(); if(tok) opt.headers["Authorization"] = "Bearer " + tok;
   if(body !== undefined){ opt.method="POST"; opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
-  // Never hang forever on a cold database wake; GETs transparently retry once
-  // (a cold Turso wake can take ~15-20s; by the retry it is warm).
-  opt.signal = AbortSignal.timeout(body===undefined ? 15000 : 20000);
-  let r;
-  try{ r = await fetch(path, opt); }
-  catch(e){
-    if(body===undefined && e.name==="TimeoutError"){
-      await new Promise(res=>setTimeout(res,2500));
-      try{ r = await fetch(path, {...opt, signal:AbortSignal.timeout(25000)}); }
-      catch(e2){ setOffline(true); throw new Error("Server is warming up — please retry in a few seconds."); }
-    } else {
-      setOffline(true);
-      throw new Error("No connection — the server is temporarily unreachable.");
+  // Never hang forever on a cold database wake; GETs transparently retry
+  // (a cold Turso wake can take ~15-20s; by the retry it is warm). Retries
+  // also absorb the 1-2 s window during an atomic deploy so users never see
+  // a "Connection lost" banner while an update is swapping over.
+  const isGet = body===undefined;
+  let r, d={}, tries=0;
+  while(true){
+    opt.signal = AbortSignal.timeout(isGet ? 15000 : 20000);
+    try{
+      r = await fetch(path, opt);
+      // a draining server during an atomic deploy gives brief 502/503/504 — retry, don't scare anyone
+      if(isGet && r.status>=502 && r.status<=504 && tries<2){
+        throw new Error("retryable");
+      }
+      break;
+    }catch(e){
+      tries++;
+      if(isGet && tries<3){ await new Promise(res=>setTimeout(res, tries*1800)); continue; }
+      bumpFails();
+      if(consecutiveFails()>=2) setOffline(true);
+      throw new Error(e.name==="TimeoutError" ? "Server is warming up — please retry in a few seconds."
+                                              : "No connection — the server is temporarily unreachable.");
     }
   }
-  setOffline(false);
-  let d = {}; try{ d = await r.json(); }catch(e){}
+  try{ d = await r.json(); }catch(e){}
+  resetFails(); setOffline(false);
   if(r.status === 401 && !path.includes("/auth/")){
     setToken(""); state.me = null; showAuth();
     throw new Error(d.error || "Please log in again.");
@@ -75,11 +84,13 @@ async function api(path, body){
   if(!r.ok){ throw new Error(d.error || ("Request failed ("+r.status+")")); }
   return d;
 }
-/* connectivity banner */
-let offlineUI=false, lastFailAt=0;
+/* connectivity banner — only after repeated real failures, never a single blip */
+let offlineUI=false, lastFailAt=0, _fails=0;
+function bumpFails(){ _fails++; lastFailAt=Date.now(); }
+function resetFails(){ _fails=0; }
+function consecutiveFails(){ return _fails; }
 function setOffline(off){
   if(off){ lastFailAt=Date.now(); }
-  else if(Date.now()-lastFailAt<3000){ return; } // ignore successes from requests already in flight
   if(off===offlineUI) return; offlineUI=off;
   let b=document.getElementById("net-banner");
   if(!b){
@@ -756,6 +767,22 @@ async function deleteAnnouncement(id){
   state.announcements=state.announcements.filter(a=>a.id!==id);
   renderSettings();
 }
+async function loadAdminUsers(){
+  const box=document.querySelector("#adm-loading"); if(!box) return;
+  try{
+    const us=(await api("/api/admin/users")).users||[];
+    const cc=document.querySelector("#adm-count"); if(cc) cc.textContent=`(${us.length})`;
+    box.outerHTML=us.map(x=>{
+      const pct=x.ch_total?Math.round(x.ch_done/x.ch_total*100):0;
+      const js=JSON.stringify(x.name).replace(/'/g,"&#39;");
+      return `<div class="adm-u">
+        <div class="adm-u-l"><b>${esc(x.name)}</b> <span class="muted sm">@${esc(x.code)}</span>${x.role==="admin"?' <span class="adm-tag">ADMIN</span>':""}
+        <div class="muted sm">${pct}% syllabus · ${x.act7} logs in last 7d · joined ${esc((x.created_at||"").slice(0,10))}${x.last_active?" · last study "+esc(x.last_active):(x.last_login?" · seen "+esc(fmtTime(x.last_login)):"")}</div></div>
+        ${x.role!=="admin"?`<button class="btn small" onclick='App.adminResetPw(${x.id},"${js}")'>Reset password</button>`:'<span class="muted sm">you</span>'}
+      </div>`;
+    }).join("");
+  }catch(e){ box.outerHTML=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
+}
 async function adminResetPw(id,name){
   const pw=prompt(`Set a NEW password for "${name}" (min 4 characters).\nFor security, nobody — not even the admin — can view their current password.`);
   if(pw===null) return;
@@ -1275,7 +1302,9 @@ async function renderChat(){
     <div class="chat-list ${state.chatOpen?'hidden-mobile':''}" id="chat-list">${chatListHTML()}</div>
     <div class="chat-pane ${state.chatOpen?'':'hidden-mobile'}" id="chat-pane">${state.chatOpen?"<div class='empty'>Loading…</div>":`<div class="empty"><span class="e">💬</span>Pick a buddy to message.</div>`}</div>
   </div>`;
-  if(state.chatOpen){ await loadThread(true); startChatPoll(); } else { await refreshThreads(); }
+  // shell is already on screen; load the open thread AND the list together
+  if(state.chatOpen){ loadThread(true).then(()=>startChatPoll()); refreshThreads(); }
+  else { refreshThreads(); }
 }
 function chatListHTML(){
   const list=state.friends;
@@ -1292,11 +1321,10 @@ function chatListHTML(){
 }
 async function refreshThreads(){
   try{
-    const d=await api("/api/messages");
+    const d=await api("/api/messages");   // one lightweight call (server joins everything)
     state.threads=d.threads||[];
-    // update unread counts on friends list
-    const friends=await api("/api/friends");
-    state.friends=friends.friends||[];
+    // unread badges from the thread payload (no heavy /api/friends refetch)
+    for(const t of state.threads){ const f=state.friends.find(x=>x.uid===t.uid); if(f) f.unread=t.unread; }
     if(!state.chatOpen){
       const box=document.querySelector("#chat-list"); if(box) box.innerHTML=chatListHTML();
       buildNav();
@@ -1686,21 +1714,10 @@ async function renderSettings(){
       <button class="btn small" onclick="App.editExam()">EDIT</button></div>
     <div class="set-row"><div class="grow"><button class="btn danger btn" onclick="App.logout()">LOGOUT</button></div></div></div>`;
 
-  // admin only: announcements + user management
+  // admin only: announcements + user management (user list fills in AFTER
+  // the screen paints so Settings opens instantly)
   if(isAdmin()){
-    let usersRows="", userCount=0;
-    try{
-      const us=(await api("/api/admin/users")).users||[]; userCount=us.length;
-      usersRows=us.map(x=>{
-        const pct=x.ch_total?Math.round(x.ch_done/x.ch_total*100):0;
-        const js=JSON.stringify(x.name).replace(/'/g,"&#39;");
-        return `<div class="adm-u">
-          <div class="adm-u-l"><b>${esc(x.name)}</b> <span class="muted sm">@${esc(x.code)}</span>${x.role==="admin"?' <span class="adm-tag">ADMIN</span>':""}
-          <div class="muted sm">${pct}% syllabus · ${x.act7} logs in last 7d · joined ${esc((x.created_at||"").slice(0,10))}${x.last_active?" · last study "+esc(x.last_active):(x.last_login?" · seen "+esc(fmtTime(x.last_login)):"")}</div></div>
-          ${x.role!=="admin"?`<button class="btn small" onclick='App.adminResetPw(${x.id},"${js}")'>Reset password</button>`:'<span class="muted sm">you</span>'}
-        </div>`;
-      }).join("");
-    }catch(e){ usersRows=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
+    const usersRows=`<div class="muted sm" id="adm-loading">Loading users…</div>`;
     const anns=(state.announcements||[]).slice(0,10).map(a=>`<div class="adm-ann"><div>${esc(a.body).replace(/\n/g,"<br>")}</div>
       <div class="muted sm">${esc(fmtTime(a.created_at))} · <a class="linklike" onclick="App.deleteAnnouncement(${a.id})">delete</a></div></div>`).join("")
       ||'<div class="muted sm">No announcements yet.</div>';
@@ -1709,7 +1726,7 @@ async function renderSettings(){
       <textarea id="ann-body" class="addinput" rows="3" placeholder="Write an announcement for every user…" maxlength="600" style="width:100%;padding:10px;min-height:70px"></textarea>
       <button class="btn-primary" style="margin-top:8px" onclick="App.postAnnouncement()">📢 POST TO EVERYONE</button>
       <div class="adm-anns">${anns}</div></div>
-    <div class="card set-card"><h3>👥 REGISTERED USERS${userCount?` <span class="muted" style="font-weight:400;font-size:11px">(${userCount})</span>`:""}</h3>
+    <div class="card set-card"><h3>👥 REGISTERED USERS <span class="muted" id="adm-count" style="font-weight:400;font-size:11px"></span></h3>
       <div class="muted sm" style="margin:6px 0">🔐 Passwords are stored one-way encrypted — <b>nobody, not even you, can view a password</b>. If someone forgets theirs, set a new one and tell them.</div>
       <div class="adm-ul">${usersRows}</div></div>`;
   }
@@ -1829,6 +1846,7 @@ async function renderSettings(){
   h+=`<div class="about-credit"><div class="about-mark">🎯 JEE WAR ROOM</div><div>Designed &amp; built by <b>Yash Sharma</b></div><div class="muted" style="font-size:11px">Two aspirants. One mission. No excuses.</div></div>`;
 
   $("#view").innerHTML=h;
+  if(isAdmin()) loadAdminUsers();
   api("/api/air").then(a=>{
     const cc=a.components, dt=a.detail;
     $("#air-explain").innerHTML=`<div class="sec-title">YOUR LIVE COMPONENTS (last 14 days)</div>

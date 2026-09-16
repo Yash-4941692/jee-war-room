@@ -1062,18 +1062,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # thread summary + unread total
             last = msgs[-1] if msgs else None
             return {"messages": msgs, "friendUid": other, "last": last}
-        # thread list: one summary per friend
-        out = []
-        vis = msg_visible(uid)
-        for pid in friend_ids(c, uid):
-            r = c.execute(f"""SELECT * FROM messages WHERE {vis} AND
-                ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) ORDER BY id DESC LIMIT 1""",
-                (uid, pid, pid, uid)).fetchone()
-            unread = c.execute(f"SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL AND {vis}",
-                               (uid, pid)).fetchone()["n"]
-            out.append({"uid": pid, "unread": unread,
-                        "last": ({"body": r["body"], "at": r["created_at"], "mine": r["sender"] == uid} if r else None)})
-        return {"threads": out}
+        # thread list: one summary per friend — single query for ALL friends
+        # (the old per-friend loop was 3 queries x N friends = slow chat open)
+        pids = friend_ids(c, uid)
+        out = {pid: {"uid": pid, "unread": 0, "last": None} for pid in pids}
+        if pids:
+            vis = msg_visible(uid)
+            ph = ",".join("?" * len(pids))
+            rows = c.execute(f"""SELECT sender,recipient,body,created_at,read_at FROM messages
+                WHERE {vis} AND (
+                  (sender=? AND recipient IN ({ph})) OR
+                  (recipient=? AND sender IN ({ph}))) ORDER BY id DESC""",
+                [uid, *pids, uid, *pids]).fetchall()
+            for r in rows:
+                other = r["recipient"] if r["sender"] == uid else r["sender"]
+                d = out.get(other)
+                if not d: continue
+                if d["last"] is None:
+                    d["last"] = {"body": r["body"], "at": r["created_at"], "mine": r["sender"] == uid}
+                if r["recipient"] == uid and r["read_at"] is None:
+                    d["unread"] += 1
+        return {"threads": [out[p] for p in pids]}
 
     def send_message(self, c, user, body):
         if not self._nonce_ok(c, user["id"], body): return
