@@ -627,7 +627,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fn = os.path.join(STATIC, "index.html")
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
                  "css": "text/css; charset=utf-8", "svg": "image/svg+xml", "png": "image/png",
-                 "ico": "image/x-icon", "json": "application/json"}.get(fn.rsplit(".", 1)[-1], "application/octet-stream")
+                 "ico": "image/x-icon", "json": "application/json", "mp3": "audio/mpeg",
+                 "webm": "video/webm", "mp4": "video/mp4"}.get(fn.rsplit(".", 1)[-1], "application/octet-stream")
         with open(fn, "rb") as f: data = f.read()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
