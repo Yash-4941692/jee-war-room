@@ -351,10 +351,11 @@ async function liveTick(){
 async function logout(){ if(!confirm("Log out?"))return; try{ await api("/api/auth/logout",{}); }catch(e){} setToken(""); location.reload(); }
 
 async function reloadMe(silent){
-  // parallel: one round-trip instead of two sequential ones
+  // parallel: fetch me, friends, and announcements together
   const [me] = await Promise.all([
     api("/api/me"),
-    api("/api/friends").then(d=>{ state.friends=d.friends||[]; fire(prefetchThreads); }).catch(()=>{ state.friends=[]; })
+    api("/api/friends").then(d=>{ state.friends=d.friends||[]; fire(prefetchThreads); }).catch(()=>{ state.friends=[]; }),
+    api("/api/announcements").then(d=>{ state.announcements=d.announcements||[]; }).catch(()=>{ state.announcements=[]; })
   ]);
   state.me = me;
 }
