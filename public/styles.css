@@ -12,7 +12,10 @@ html,body{margin:0;padding:0}
 body{
   background:var(--bg); color:var(--txt);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,"Helvetica Neue",Arial,sans-serif;
-  font-size:15px; line-height:1.45; overscroll-behavior-y:none;
+  font-size:15px; line-height:1.45;
+  /* NOTE: never put overscroll-behavior:none here: together with overflow-x
+     on <html>/<body> it makes mobile Chrome ignore touch drags over content
+     (the whole page freezes). Containment is set per inner scroller instead. */
 }
 .hidden{display:none !important}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;font-size:inherit}
@@ -644,7 +647,15 @@ body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 .set-row,.tog{min-width:0}
 .set-row .grow,.tog .tl{min-width:0}
 .flex{min-width:0}
+/* Mobile scroll fix: `overflow-x:hidden` on html+body plus overscroll
+   settings on body broke touch scrolling on Android Chrome (the page felt
+   frozen from content areas). `clip` guards sideways scroll without creating
+   a scroll container; fall back to hidden on browsers without clip support. */
 html,body{overflow-x:hidden}
+@supports (overflow:clip){
+  html,body{overflow-x:clip}
+}
+body{overflow-y:auto;-webkit-overflow-scrolling:touch}
 
 /* mobile chapter rows: two clean lines instead of cramped squeeze */
 @media(max-width:560px){
@@ -707,7 +718,7 @@ html,body{overflow-x:hidden}
 #toast-root{pointer-events:none}
 #toast-root .toast{pointer-events:auto}
 .msg-body{touch-action:pan-y;overscroll-behavior:contain}
-.modal{touch-action:pan-y}
+.modal{touch-action:pan-y;overscroll-behavior:contain}
 @media(max-width:760px){
   .chat-pane{min-height:0}
   .msg-body{max-height:64vh;-webkit-overflow-scrolling:touch;touch-action:pan-y}
