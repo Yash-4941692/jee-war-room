@@ -576,7 +576,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p.startswith("/api/"):
             body = self._body()
             if body is None: return self._err("Invalid request body")
-            auth_free = (p in ("/api/auth/signup", "/api/auth/login"))
+            auth_free = (p in ("/api/auth/signup", "/api/auth/login", "/api/auth/reset-password"))
             user = self._auth()
             if not user and not auth_free: return self._err("Not authenticated", 401)
             try: return self.api_post(user, p, body)
