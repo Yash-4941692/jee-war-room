@@ -217,8 +217,20 @@ function authTab(t){
   $("#tab-login").classList.toggle("active",t==="login");
   $("#tab-signup").classList.toggle("active",t==="signup");
   $("#signup-extra").classList.toggle("hidden",t==="login");
+  const forgot=$("#auth-forgot"); if(forgot) forgot.classList.toggle("hidden",t!=="login");
   $("#auth-btn").textContent = t==="login" ? "LOGIN" : "CREATE ACCOUNT";
   $("#auth-err").textContent=""; state.authMode=t;
+}
+function forgotPasswordModal(){
+  modal(`${mHead("🔑 Password Reset")}
+    <div style="line-height:1.6;font-size:14px;margin-bottom:14px">
+      Passwords in JEE War Room are one-way encrypted for privacy — nobody can read your current password.
+    </div>
+    <div class="summary-box" style="margin-bottom:14px">
+      <span class="big-e">👑</span>
+      <div><b>Ask Yash (Admin)</b><br><span class="muted sm">Ask Yash to reset your password. He can set a new one for your account in seconds from Settings → Registered Users.</span></div>
+    </div>
+    <button class="btn-primary full" onclick="App.closeModal()">GOT IT</button>`);
 }
 async function authSubmit(ev){
   ev.preventDefault();
@@ -786,20 +798,21 @@ async function deleteAnnouncement(id){
   renderSettings();
 }
 async function loadAdminUsers(){
-  const box=document.querySelector("#adm-loading"); if(!box) return;
+  const wrap=document.querySelector("#adm-users-wrap"); if(!wrap) return;
   try{
     const us=(await api("/api/admin/users")).users||[];
+    state.adminUsers=us;
     const cc=document.querySelector("#adm-count"); if(cc) cc.textContent=`(${us.length})`;
-    box.outerHTML=us.map(x=>{
+    wrap.innerHTML=us.map(x=>{
       const pct=x.ch_total?Math.round(x.ch_done/x.ch_total*100):0;
-      const js=JSON.stringify(x.name).replace(/'/g,"&#39;");
+      const isMe=(x.id===state.me?.user?.id);
       return `<div class="adm-u">
-        <div class="adm-u-l"><b>${esc(x.name)}</b> <span class="muted sm">@${esc(x.code)}</span>${x.role==="admin"?' <span class="adm-tag">ADMIN</span>':""}
+        <div class="adm-u-l"><b>${esc(x.name)}</b> <span class="muted sm">@${esc(x.code)}</span>${x.role==="admin"?' <span class="adm-tag">ADMIN</span>':""}${isMe?' <span class="muted sm">(you)</span>':""}
         <div class="muted sm">${pct}% syllabus · ${x.act7} logs in last 7d · joined ${esc((x.created_at||"").slice(0,10))}${x.last_active?" · last study "+esc(x.last_active):(x.last_login?" · seen "+esc(fmtTime(x.last_login)):"")}</div></div>
-        ${x.role!=="admin"?`<button class="btn small" onclick='App.adminResetPw(${x.id},"${js}")'>Reset password</button>`:'<span class="muted sm">you</span>'}
+        <button class="btn small" onclick="App.adminResetPw(${x.id})">Reset password</button>
       </div>`;
     }).join("");
-  }catch(e){ box.outerHTML=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
+  }catch(e){ wrap.innerHTML=`<div class="muted sm">Couldn't load users: ${esc(e.message)}</div>`; }
 }
 async function sendReport(){
   const ta=$("#report-body"), text=(ta?.value||"").trim(), note=$("#report-sent");
@@ -827,12 +840,49 @@ async function loadAdminReports(){
 async function resolveReport(id){
   try{ await api("/api/admin/report/resolve",{id}); loadAdminReports(); }catch(e){ toast(e.message,"bad"); }
 }
-async function adminResetPw(id,name){
-  const pw=prompt(`Set a NEW password for "${name}" (min 4 characters).\nFor security, nobody — not even the admin — can view their current password.`);
-  if(pw===null) return;
-  if(pw.trim().length<4){ toast("Password too short","bad"); return; }
-  await api("/api/admin/set-password",{userId:id,password:pw.trim()});
-  toast("New password set for "+name,"good");
+function adminResetPw(id){
+  id=parseInt(id);
+  const u=(state.adminUsers||[]).find(x=>x.id===id);
+  const name=u ? u.name : (id===state.me?.user?.id ? state.me.user.name : "User");
+  modal(`${mHead("🔐 Set New Password")}
+    <div style="margin-bottom:12px;font-size:14px">Set a new password for <b>${esc(name)}</b>:</div>
+    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
+    <div style="margin:8px 0 12px">
+      <input id="adm-new-pw" type="text" class="addinput" style="width:100%;font-size:16px;padding:10px" placeholder="Enter new password" autocomplete="off" autocorrect="off" autocapitalize="off">
+    </div>
+    <div class="muted sm" style="margin-bottom:14px;line-height:1.4">
+      Passwords are stored one-way encrypted — nobody can view current passwords. Share this new password with <b>${esc(name)}</b>.
+    </div>
+    <div id="adm-pw-err" class="auth-err" style="margin-bottom:8px"></div>
+    <div class="flex" style="gap:8px">
+      <button class="btn full" onclick="App.closeModal()">CANCEL</button>
+      <button class="btn-primary full" id="adm-save-pw-btn" onclick="App.saveAdminPw(${id})">SET PASSWORD</button>
+    </div>`);
+  setTimeout(()=>{ const inp=document.getElementById("adm-new-pw"); if(inp) inp.focus(); }, 120);
+}
+async function saveAdminPw(id){
+  id=parseInt(id);
+  const inp=document.getElementById("adm-new-pw");
+  const err=document.getElementById("adm-pw-err");
+  const pw=(inp?.value||"").trim();
+  if(pw.length<4){
+    if(err) err.textContent="Password must be at least 4 characters.";
+    toast("Password must be at least 4 characters","bad");
+    return;
+  }
+  const btn=document.getElementById("adm-save-pw-btn");
+  if(btn){ btn.disabled=true; btn.textContent="SAVING…"; }
+  try{
+    const u=(state.adminUsers||[]).find(x=>x.id===id);
+    const name=u ? u.name : (id===state.me?.user?.id ? state.me.user.name : "User");
+    await api("/api/admin/set-password",{userId:id,password:pw});
+    closeModal();
+    toast("New password set for "+name,"good");
+  }catch(e){
+    if(btn){ btn.disabled=false; btn.textContent="SET PASSWORD"; }
+    if(err) err.textContent=e.message;
+    toast(e.message,"bad");
+  }
 }
 
 /* ============================================================ TODAY */
@@ -1808,6 +1858,8 @@ async function renderSettings(){
         `<button class="color-dot ${u.avatar_color===c?'sel':''}" style="background:${c}" onclick="App.setColor('${c}')"></button>`).join("")}</div></div></div>
     <div class="set-row"><div class="grow"><div class="muted">JEE Main exam date</div><b>${u.exam_date?fmtDate(u.exam_date):'not set'}</b></div>
       <button class="btn small" onclick="App.editExam()">EDIT</button></div>
+    <div class="set-row"><div class="grow"><div class="muted">Password</div><b>••••••••</b></div>
+      <button class="btn small" onclick="App.changePasswordModal()">CHANGE</button></div>
     <div class="set-row"><div class="grow"><button class="btn danger btn" onclick="App.logout()">LOGOUT</button></div></div></div>`;
 
   // admin only: announcements + user management (user list fills in AFTER
@@ -1824,7 +1876,7 @@ async function renderSettings(){
       <div class="adm-anns">${anns}</div></div>
     <div class="card set-card"><h3>👥 REGISTERED USERS <span class="muted" id="adm-count" style="font-weight:400;font-size:11px"></span></h3>
       <div class="muted sm" style="margin:6px 0">🔐 Passwords are stored one-way encrypted — <b>nobody, not even you, can view a password</b>. If someone forgets theirs, set a new one and tell them.</div>
-      <div class="adm-ul">${usersRows}</div></div>`;
+      <div id="adm-users-wrap" class="adm-ul">${usersRows}</div></div>`;
   }
 
   // friends
@@ -1963,6 +2015,63 @@ async function renderSettings(){
       Raw today: <b>${a.rawToday}</b> · Smoothed score: <b>${Math.round(a.score)}</b> · Projected AIR: <b>${a.airFormatted}</b></div>`;
   }).catch(()=>{});
 }
+function changePasswordModal(){
+  const isAdm=isAdmin();
+  modal(`${mHead("🔐 Change Password")}
+    ${!isAdm ? `
+      <div class="m-step-lab">CURRENT PASSWORD</div>
+      <input id="pw-cur" type="password" class="addinput" style="width:100%;margin:6px 0 12px;padding:10px" placeholder="Current password">
+    ` : ''}
+    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
+    <input id="pw-new" type="password" class="addinput" style="width:100%;margin:6px 0 12px;padding:10px" placeholder="New password">
+    <div class="m-step-lab">CONFIRM NEW PASSWORD</div>
+    <input id="pw-conf" type="password" class="addinput" style="width:100%;margin:6px 0 14px;padding:10px" placeholder="Re-enter new password">
+    <div id="pw-err" class="auth-err" style="margin-bottom:8px"></div>
+    <div class="flex" style="gap:8px">
+      <button class="btn full" onclick="App.closeModal()">CANCEL</button>
+      <button class="btn-primary full" id="pw-save-btn" onclick="App.saveMyPassword()">UPDATE</button>
+    </div>`);
+  setTimeout(()=>{ const el=document.getElementById(isAdm?"pw-new":"pw-cur"); if(el) el.focus(); }, 120);
+}
+async function saveMyPassword(){
+  const curInp=document.getElementById("pw-cur");
+  const newInp=document.getElementById("pw-new");
+  const confInp=document.getElementById("pw-conf");
+  const err=document.getElementById("pw-err");
+  const cur=(curInp?.value||"").trim();
+  const nw=(newInp?.value||"").trim();
+  const conf=(confInp?.value||"").trim();
+  if(!isAdmin() && !cur){
+    if(err) err.textContent="Please enter your current password.";
+    toast("Please enter your current password","bad");
+    return;
+  }
+  if(nw.length<4){
+    if(err) err.textContent="New password must be at least 4 characters.";
+    toast("New password must be at least 4 characters","bad");
+    return;
+  }
+  if(nw!==conf){
+    if(err) err.textContent="New passwords do not match.";
+    toast("New passwords do not match","bad");
+    return;
+  }
+  const btn=document.getElementById("pw-save-btn");
+  if(btn){ btn.disabled=true; btn.textContent="UPDATING…"; }
+  try{
+    if(isAdmin()){
+      await api("/api/admin/set-password",{userId:state.me.user.id,password:nw});
+    }else{
+      await api("/api/me/password",{currentPassword:cur,newPassword:nw});
+    }
+    closeModal();
+    toast("Password updated successfully!","good");
+  }catch(e){
+    if(btn){ btn.disabled=false; btn.textContent="UPDATE"; }
+    if(err) err.textContent=e.message;
+    toast(e.message,"bad");
+  }
+}
 async function setName(){
   const name=prompt("New name:",state.me.user.name); if(!name)return;
   try{ await api("/api/me",{name:name.trim()}); await refresh(); }catch(e){toast(e.message,"bad");}
@@ -2099,7 +2208,8 @@ return {
   setName, setColor, copyCode, unlink, connectSettings, toggle, toggleCard, moveCard,
   toggleActivity, addActivity, removeActivity, addMetric, toggleMetric, moveMetric, removeMetric,
   addTemplate, editTemplate, saveTemplate, removeTemplate, saveXP, saveWeights, exportData, wipeData,
-  dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw,
+  dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw, saveAdminPw,
+  changePasswordModal, saveMyPassword, forgotPasswordModal,
   sendReport, resolveReport,
   beginTimer,
 };

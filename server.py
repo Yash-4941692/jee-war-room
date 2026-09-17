@@ -912,6 +912,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if tok: c.execute("DELETE FROM sessions WHERE token=?", (tok,)); c.commit()
                 return self._send({"ok": True}, extra_headers=[("Set-Cookie", self._cookie_header("", clear=True))])
             if p == "/api/me": return self.update_me(c, uid, body)
+            if p == "/api/me/password": return self.change_my_password(c, uid, body)
             if p == "/api/friend/connect": return self.friend_connect(c, user, body)
             if p == "/api/friend/unlink": return self.friend_unlink(c, user, body)
             if p == "/api/messages": return self.send_message(c, user, body)
@@ -1551,13 +1552,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def admin_set_password(self, c, uid, body):
         if not self.is_admin(c, uid): return self._err("Admin only.", 403)
         target = body.get("userId")
-        newpw = body.get("password") or ""
+        try: target = int(target)
+        except Exception: pass
+        newpw = (body.get("password") or "").strip()
         if len(newpw) < 4: return self._err("Password must be at least 4 characters.")
-        r = c.execute("SELECT id FROM users WHERE id=?", (target,)).fetchone() if target else None
+        r = c.execute("SELECT id FROM users WHERE id=?", (target,)).fetchone() if target is not None else None
         if not r: return self._err("User not found.")
         salt = hashlib.sha256(os.urandom(16)).hexdigest()
         c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (hash_pw(newpw, salt), salt, target))
         # existing sessions for that user stay valid; admin can tell them the new password
+        c.commit()
+        return self._send({"ok": True})
+
+    def change_my_password(self, c, uid, body):
+        curpw = (body.get("currentPassword") or "").strip()
+        newpw = (body.get("newPassword") or "").strip()
+        if len(newpw) < 4: return self._err("New password must be at least 4 characters.")
+        u = c.execute("SELECT pass_hash, salt FROM users WHERE id=?", (uid,)).fetchone()
+        if not u: return self._err("User not found.", 404)
+        is_adm = self.is_admin(c, uid)
+        if not is_adm or curpw:
+            if not hmac_mod.compare_digest(u["pass_hash"], hash_pw(curpw, u["salt"])):
+                return self._err("Current password is incorrect.", 400)
+        salt = hashlib.sha256(os.urandom(16)).hexdigest()
+        c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (hash_pw(newpw, salt), salt, uid))
         c.commit()
         return self._send({"ok": True})
 

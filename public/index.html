@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a0d13">
 <title>JEE WAR ROOM</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
-<link rel="stylesheet" href="/styles.css?v=16">
+<link rel="stylesheet" href="/styles.css?v=17">
 </head>
 <body>
 <div id="boot" class="boot"><div class="boot-mark">🎯</div><div class="boot-txt">JEE WAR ROOM</div></div>
@@ -31,6 +31,9 @@
       </div>
       <button class="btn-primary big" id="auth-btn" type="submit">ENTER THE WAR ROOM</button>
       <div id="auth-err" class="auth-err"></div>
+      <div id="auth-forgot" style="margin-top:14px;text-align:center">
+        <a class="linklike muted sm" href="javascript:void(0)" onclick="App.forgotPasswordModal()">Forgot password?</a>
+      </div>
     </form>
     <div id="auth-after" class="hidden">
       <div class="after-title">You're in. 🔒</div>
@@ -67,6 +70,6 @@
 
 <div id="modal-root"></div>
 <div id="toast-root"></div>
-<script src="/app.js?v=16"></script>
+<script src="/app.js?v=17"></script>
 </body>
 </html>
