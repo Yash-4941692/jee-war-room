@@ -690,7 +690,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send({"connected": bool(ids), "count": len(ids),
                                    "max": MAX_FRIENDS, "friends": [v for v in views if v]})
             if p == "/api/messages":
-                return self.messages_list(c, uid, q)
+                return self._send(self.messages_list(c, uid, q))
             if p == "/api/announcements":
                 rows = c.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 50").fetchall()
                 seen = list(s.get("seenAnnouncements") or [])
