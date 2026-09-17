@@ -291,6 +291,12 @@ class _Conn:
         if not CLOUD:
             try: self._inner.close()
             except Exception: pass
+        else:
+            try:
+                if getattr(self._inner, "in_transaction", False):
+                    self._inner.rollback()
+            except Exception:
+                pass
 
     # PRAGMA table_info shim used by the migration code
     def table_columns(self, tbl):

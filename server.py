@@ -98,12 +98,16 @@ _SCHEMA_SQL = r"""
 def init_db():
     c = db()
     if dbwrap.CLOUD:
-        # Serverless cold boots are frequent; the full idempotent DDL script
-        # below is ~15 round-trips. In the cloud run a 1-query schema check
-        # first and only execute the DDL when a new table is actually missing.
+        # Fast path: if reports table exists, schema is already complete
+        try:
+            c.execute("SELECT 1 FROM reports LIMIT 1").fetchone()
+            c.close()
+            return
+        except Exception:
+            pass
         have = {r[0] for r in c.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "announcements" not in have:
+        if "announcements" not in have or "users" not in have:
             c.executescript(_SCHEMA_SQL)
         elif "reports" not in have:
             c.execute("""CREATE TABLE IF NOT EXISTS reports(
@@ -124,10 +128,6 @@ def init_db():
             c.execute("ALTER TABLE chapters ADD COLUMN lectures_total INTEGER NOT NULL DEFAULT 0")
         if "lectures_done" not in ch_cols:
             c.execute("ALTER TABLE chapters ADD COLUMN lectures_done INTEGER NOT NULL DEFAULT 0")
-        c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
-            SELECT id, partner_id, created_at FROM users WHERE partner_id IS NOT NULL""")
-        c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
-            SELECT partner_id, id, created_at FROM users WHERE partner_id IS NOT NULL""")
         c.commit(); c.close()
         return
     c.executescript(_SCHEMA_SQL)
@@ -144,11 +144,6 @@ def init_db():
     if "hidden" not in cols("messages"):
         # comma-separated user ids who cleared this message from their own chat view
         c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
-    # migrate single-partner links into the multi-friend friendships table
-    c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
-        SELECT id, partner_id, created_at FROM users WHERE partner_id IS NOT NULL""")
-    c.execute("""INSERT OR IGNORE INTO friendships(user_id,friend_id,created_at)
-        SELECT partner_id, id, created_at FROM users WHERE partner_id IS NOT NULL""")
     c.commit(); c.close()
 
 def seed_chapters(c, uid):
@@ -294,13 +289,15 @@ def raw_score(c, uid, d, s):
     planned = sum(tm.values())
     donew = tm.get("done", 0) + 0.5 * tm.get("partial", 0)
     T = (donew / planned) if planned else 0.0
-    # practice (questions over 14 days; target ~400)
-    q = c.execute("SELECT COALESCE(SUM(amount),0) v FROM activities WHERE user_id=? AND day BETWEEN ? AND ? AND type IN ('pyq','dpp','homework')",
-                  (uid, start, end)).fetchone()["v"]
+    # practice, revision, distraction (grouped single query over 14d)
+    q = 0; rm = 0; dm = 0
+    for r in c.execute("SELECT type, SUM(amount) sa, SUM(duration) sd FROM activities WHERE user_id=? AND day BETWEEN ? AND ? GROUP BY type",
+                       (uid, start, end)).fetchall():
+        tp = r["type"]
+        if tp in ('pyq', 'dpp', 'homework'): q += (r["sa"] or 0)
+        elif tp == 'revision': rm += (r["sd"] or 0)
+        elif tp == 'distraction': dm += (r["sd"] or 0)
     P = min(1.0, q / 400.0)
-    # revision (target 300 min over 14d)
-    rm = c.execute("SELECT COALESCE(SUM(duration),0) v FROM activities WHERE user_id=? AND day BETWEEN ? AND ? AND type='revision'",
-                   (uid, start, end)).fetchone()["v"]
     R = min(1.0, rm / 300.0)
     # mocks
     m = c.execute("SELECT * FROM mocks WHERE user_id=? AND day<=? ORDER BY day DESC, id DESC LIMIT 1",
@@ -319,8 +316,6 @@ def raw_score(c, uid, d, s):
         M = 0.0  # no mock taken yet — no free credit, fresh users stay at AIR 600,000
     M = clamp(M, 0, 1)
     # penalties
-    dm = c.execute("SELECT COALESCE(SUM(duration),0) v FROM activities WHERE user_id=? AND day BETWEEN ? AND ? AND type='distraction'",
-                   (uid, start, end)).fetchone()["v"]
     penalty = min(10, dm / 60.0) + min(5, tm.get("missed", 0) * 0.5)
     comps = {"consistency": C, "targets": T, "practice": P, "revision": R, "mock": M}
     val = 100.0 * sum(max(0, w[k]) * comps[k] for k in comps) / wsum - penalty
@@ -330,20 +325,22 @@ def raw_score(c, uid, d, s):
 def air_for(score):
     return clamp(int(round(600000 * math.exp(-0.064 * score))), 1, 600000)
 
-def ensure_snapshots(c, uid, s):
+def ensure_snapshots(c, uid, s, force_today=False):
     """Backfill deterministic daily score/AIR snapshots up to today."""
     u = c.execute("SELECT created_at FROM users WHERE id=?", (uid,)).fetchone()
+    if not u: return
     first = date.fromisoformat(u["created_at"][:10])
     today_d = datetime.now(IST).date()
     last = c.execute("SELECT MAX(day) d FROM snapshots WHERE user_id=?", (uid,)).fetchone()["d"]
     prev_score = 0.0
     if last:
         if last == DAY_F(today_d):
-            # recompute yesterday + today (catches late-entered data) deterministically
-            y2 = c.execute("SELECT score FROM snapshots WHERE user_id=? AND day=?",
-                           (uid, DAY_F(today_d - timedelta(days=2)))).fetchone()
-            prev_score = y2["score"] if y2 else 0.0
-            cur = today_d - timedelta(days=1)
+            if not force_today:
+                return
+            y = c.execute("SELECT score FROM snapshots WHERE user_id=? AND day=?",
+                          (uid, DAY_F(today_d - timedelta(days=1)))).fetchone()
+            prev_score = y["score"] if y else 0.0
+            cur = today_d
         else:
             prev_score = c.execute("SELECT score FROM snapshots WHERE user_id=? AND day=?", (uid, last)).fetchone()["score"]
             cur = date.fromisoformat(last) + timedelta(days=1)
@@ -356,13 +353,16 @@ def ensure_snapshots(c, uid, s):
         prev_score = 0.0
     ema = clamp(s.get("airEMA", 0.88), 0.5, 0.97)
     guard = 0
+    wrote = False
     while cur <= today and guard < 140:
         raw, _, _ = raw_score(c, uid, cur, s)
         sc = round(ema * prev_score + (1 - ema) * raw, 2)
         c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,?,?)",
                   (uid, DAY_F(cur), sc, air_for(sc)))
         prev_score = sc; cur += timedelta(days=1); guard += 1
-    c.commit()
+        wrote = True
+    if wrote:
+        c.commit()
 
 def level_info(xp):
     L = 1
@@ -384,22 +384,23 @@ def streak_info(c, uid, s):
     A day counts towards streak if the student logged study activities,
     focus sessions, mocks, or completed targets."""
     thr = s.get("streakThreshold", 70) / 100.0
+    since = DAY_F(datetime.now(IST).date() - timedelta(days=120))
     # 1. Days with study activities (lectures, revision, pyqs, dpp, homework, study)
     rows_act = c.execute("""
         SELECT DISTINCT day FROM activities 
-        WHERE user_id=? AND type!='distraction'
-    """, (uid,)).fetchall()
+        WHERE user_id=? AND day>=? AND type!='distraction'
+    """, (uid, since)).fetchall()
     active_days = {r["day"] if hasattr(r, "keys") else r[0] for r in rows_act}
 
     # 2. Days with mock tests
-    rows_mock = c.execute("SELECT DISTINCT day FROM mocks WHERE user_id=?", (uid,)).fetchall()
+    rows_mock = c.execute("SELECT DISTINCT day FROM mocks WHERE user_id=? AND day>=?", (uid, since)).fetchall()
     active_days |= {r["day"] if hasattr(r, "keys") else r[0] for r in rows_mock}
 
     # 3. Days with targets completed (status done/partial, or meeting streakThreshold)
     rows_tar = c.execute("""
         SELECT day, status FROM targets 
-        WHERE user_id=? ORDER BY day DESC LIMIT 400
-    """, (uid,)).fetchall()
+        WHERE user_id=? AND day>=? ORDER BY day DESC LIMIT 400
+    """, (uid, since)).fetchall()
     t_days = defaultdict(lambda: [0, 0.0])
     for r in rows_tar:
         day = r["day"] if hasattr(r, "keys") else r[0]
@@ -472,19 +473,20 @@ def touch_chapter(c, uid, subject, chapter):
 
 def today_summary(c, uid, s):
     t = TODAY()
-    day_min = c.execute("SELECT COALESCE(SUM(duration),0) v FROM activities WHERE user_id=? AND day=? AND type IN ('study','revision')", (uid, t)).fetchone()["v"]
-    q = c.execute("SELECT COALESCE(SUM(amount),0) v FROM activities WHERE user_id=? AND day=? AND type IN ('pyq','dpp','homework')", (uid, t)).fetchone()["v"]
-    distract = c.execute("SELECT COALESCE(SUM(duration),0) v FROM activities WHERE user_id=? AND day=? AND type='distraction'", (uid, t)).fetchone()["v"]
+    day_min = 0; q = 0; distract = 0; custom = {}
+    for r in c.execute("SELECT type,custom_key,SUM(amount) am,SUM(duration) dm,COUNT(*) n FROM activities WHERE user_id=? AND day=? GROUP BY type,custom_key", (uid, t)):
+        tp = r["type"]; am = r["am"] or 0; dm = r["dm"] or 0; n = r["n"]
+        if tp in ("study", "revision"): day_min += dm
+        if tp in ("pyq", "dpp", "homework"): q += am
+        if tp == "distraction": distract += dm
+        if tp == "metric" or r["custom_key"]:
+            custom[r["custom_key"] or ("__" + tp)] = {"amount": am, "duration": dm, "logs": n}
     tr = c.execute("SELECT status, COUNT(*) n FROM targets WHERE user_id=? AND day=? GROUP BY status", (uid, t)).fetchall()
     tm = {r["status"]: r["n"] for r in tr}
     planned = sum(tm.values()); done = tm.get("done", 0) + 0.5 * tm.get("partial", 0)
     exe = round(100 * done / planned) if planned else 0
     mocks_n = c.execute("SELECT COUNT(*) n FROM mocks WHERE user_id=? AND day=?", (uid, t)).fetchone()["n"]
     errs_n = c.execute("SELECT COUNT(*) n FROM errors WHERE user_id=? AND day=?", (uid, t)).fetchone()["n"]
-    # custom metrics + custom activities for today
-    custom = {}
-    for r in c.execute("SELECT type,custom_key,SUM(amount) am,SUM(duration) dm,COUNT(*) n FROM activities WHERE user_id=? AND day=? AND (type='metric' OR custom_key IS NOT NULL) GROUP BY type,custom_key", (uid, t)):
-        custom[r["custom_key"] or ("__"+r["type"])] = {"amount": r["am"] or 0, "duration": r["dm"] or 0, "logs": r["n"]}
     return {"minutes": day_min, "questions": q, "distractionMin": distract,
             "planned": planned, "done": tm.get("done", 0), "partial": tm.get("partial", 0),
             "missed": tm.get("missed", 0), "execution": exe, "mocks": mocks_n, "errors": errs_n,
@@ -641,7 +643,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ============================================================ GET API
     def api_get(self, user, p, q):
         c = db(); uid = user["id"]; s = get_settings(c, uid)
-        sweep_targets(c, uid, s); save_settings(c, uid, s)
+        if s.get("sweepDay") != TODAY():
+            sweep_targets(c, uid, s)
+            save_settings(c, uid, s)
+            c.commit()
         try:
             if p == "/api/me":
                 ensure_snapshots(c, uid, s)
@@ -650,7 +655,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "summary": today_summary(c, uid, s),
                        "xp": level_info(xp_total(c, uid)), "streak": streak_info(c, uid, s),
                        "air": self._air(c, uid, s)}
-                save_settings(c, uid, s)
                 return self._send(out)
             if p == "/api/targets":
                 day = q.get("date", [TODAY()])[0]
@@ -679,7 +683,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 r = c.execute("SELECT * FROM timers WHERE user_id=? AND logged=0 ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
                 return self._send({"timer": rowdict(r)})
             if p == "/api/air":
-                ensure_snapshots(c, uid, s)
                 return self._send(self._air(c, uid, s, with_comps=True, settings=s))
             if p == "/api/friends":
                 ids = friend_ids(c, uid)
@@ -687,7 +690,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send({"connected": bool(ids), "count": len(ids),
                                    "max": MAX_FRIENDS, "friends": [v for v in views if v]})
             if p == "/api/messages":
-                return self._send(self.messages_list(c, uid, q))
+                return self.messages_list(c, uid, q)
             if p == "/api/announcements":
                 rows = c.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 50").fetchall()
                 seen = list(s.get("seenAnnouncements") or [])
@@ -763,9 +766,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if sh.get("streak"): out["streak"] = streak_info(c, pid, ps)
         if sh.get("xp"): out["xp"] = level_info(xp_total(c, pid))
         if sh.get("score") or sh.get("air"):
-            air = self._air(c, pid, ps)
-            if sh.get("score"): out["score"] = air["score"]
-            if sh.get("air"): out["air"] = air["air"]; out["airFormatted"] = air["airFormatted"]; out["airTrend7"] = air["trend7"]
+            snap = c.execute("SELECT score, air FROM snapshots WHERE user_id=? ORDER BY day DESC LIMIT 1", (pid,)).fetchone()
+            cur_air = snap["air"] if snap else 600000
+            cur_score = snap["score"] if snap else 0.0
+            d7 = c.execute("SELECT air FROM snapshots WHERE user_id=? AND day=?",
+                           (pid, DAY_F(datetime.now(IST).date() - timedelta(days=7)))).fetchone()
+            trend7 = (d7["air"] - cur_air) if d7 else 0
+            if sh.get("score"): out["score"] = cur_score
+            if sh.get("air"): out["air"] = cur_air; out["airFormatted"] = ind(cur_air); out["airTrend7"] = trend7
         if sh.get("mocks"):
             m = c.execute("SELECT * FROM mocks WHERE user_id=? ORDER BY day DESC,id DESC LIMIT 1", (pid,)).fetchone()
             if m: out["latestMock"] = self._mock_view(m)
@@ -776,8 +784,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not out.get("shareBlock"):
             return out
         wk = DAY_F(datetime.now(IST).date() - timedelta(days=6))
-        wm = c.execute("SELECT COALESCE(SUM(duration),0) v FROM activities WHERE user_id=? AND day>=? AND type IN ('study','revision')", (pid, wk)).fetchone()["v"]
-        wq = c.execute("SELECT COALESCE(SUM(amount),0) v FROM activities WHERE user_id=? AND day>=? AND type IN ('pyq','dpp','homework')", (pid, wk)).fetchone()["v"]
+        wm = 0; wq = 0
+        for r in c.execute("SELECT type, SUM(duration) dm, SUM(amount) am FROM activities WHERE user_id=? AND day>=? GROUP BY type", (pid, wk)):
+            if r["type"] in ('study', 'revision'): wm += (r["dm"] or 0)
+            if r["type"] in ('pyq', 'dpp', 'homework'): wq += (r["am"] or 0)
         wtr = c.execute("SELECT status,COUNT(*) n FROM targets WHERE user_id=? AND day>=? GROUP BY status", (pid, wk)).fetchall()
         wtm = {r["status"]: r["n"] for r in wtr}
         wp = sum(wtm.values()); wd = wtm.get("done", 0) + 0.5 * wtm.get("partial", 0)
@@ -933,7 +943,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p == "/api/auth/login": return self.login(body)
         if p == "/api/auth/reset-password": return self.reset_password(body)
         c = db(); uid = user["id"]; s = get_settings(c, uid)
-        sweep_targets(c, uid, s)
+        if s.get("sweepDay") != TODAY():
+            sweep_targets(c, uid, s)
+            save_settings(c, uid, s)
+            c.commit()
         try:
             if p == "/api/auth/logout":
                 tok = None
@@ -1283,7 +1296,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             (uid, typ, body.get("customKey"), subj, chap, amount, duration, extra, note, day,
              now_iso()))
         add_xp(c, uid, gained, reason, "activity", cur.lastrowid, s, commit=False)
-        ensure_snapshots(c, uid, s)
+        ensure_snapshots(c, uid, s, force_today=True)
         save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid, "xpGained": gained}
         self._nonce_save(c, uid, nonce, result)
@@ -1359,7 +1372,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if f == "subject" and v and v not in SUBJECTS: v = ""
                 if f == "chapter" and v and v not in chapter_names(c, uid): v = ""
                 c.execute(f"UPDATE targets SET {f}=? WHERE id=?", (v, tid))
-        ensure_snapshots(c, uid, s); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
         return self._send({"ok": True})
 
     def dup_target(self, c, uid, tid, body):
@@ -1405,6 +1418,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if new_st == "completed" and old_st != "completed":
                     s = get_settings(c, uid)
                     add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
+                    ensure_snapshots(c, uid, s, force_today=True)
+                    save_settings(c, uid, s)
         if "name" in body:
             nm = (body["name"] or "").strip()[:80]
             if nm: c.execute("UPDATE chapters SET name=? WHERE id=?", (nm, cid))
@@ -1432,6 +1447,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             (uid, "study", r["subject"], r["name"], "Syllabus progress", f"Chapter completed: {r['name']}", TODAY(), now_iso()))
                     s = get_settings(c, uid)
                     add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
+                    ensure_snapshots(c, uid, s, force_today=True)
+                    save_settings(c, uid, s)
                 elif done > 0 and r["status"] == "not_started":
                     c.execute("UPDATE chapters SET status='in_progress' WHERE id=?", (cid,))
             except Exception: pass
@@ -1498,7 +1515,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             VALUES(?,?,?,?,?,0,0,?,?,?,?)""",
             (uid, "mock", None, "", "", tt, f"{tt} ({day})", day, ts))
         add_xp(c, uid, s["xp"]["mock"], "Mock test", "mock", cur.lastrowid, s, commit=False)
-        ensure_snapshots(c, uid, s); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)
@@ -1520,7 +1537,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         c.execute("INSERT INTO activities(user_id,type,subject,chapter,amount,duration,extra,note,day,created_at) VALUES(?,?,?,?,0,0,?,?,?,?)",
                   (uid, "error", subj, chap, et, (body.get("note") or "")[:300], day, now_iso()))
         add_xp(c, uid, s["xp"]["error"], "Error analysis", "error", cur.lastrowid, s, commit=False)
-        ensure_snapshots(c, uid, s); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)
@@ -1568,7 +1585,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         touch_chapter(c, uid, r["subject"], r["chapter"])
         c.execute("UPDATE timers SET logged=1,running=?,ended_at=? WHERE id=?",
                   (running, now_iso(), tid))
-        ensure_snapshots(c, uid, s); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "minutes": mins, "xpGained": gained}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)

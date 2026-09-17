@@ -9,7 +9,6 @@ request, exactly like http.server.BaseHTTPRequestHandler.
 """
 import os
 import sys
-import threading
 from urllib.parse import urlparse, parse_qs, urlencode
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -18,31 +17,11 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Self-healing schema MUST run synchronously at cold import: serverless
-# freezes the instance the moment the first response finishes, so a daemon
-# thread started here may be paused mid-way and never complete. The cloud path
-# is a single 1-query table check (~0.1s same-region); it only runs DDL when a
-# genuinely new table is missing. Wrapped so schema maintenance can never take
-# a request down.
+# Fast read schema verification on cold start (DDL only if tables missing)
 try:
     server.init_db()
 except Exception as _e:
     print("init_db warning:", _e)
-
-# Background warmer (schema is already handled above): a SELECT 1 every 4 min
-# keeps the Turso database awake while this instance is warm.
-def _warm_loop():
-    import time
-    while True:
-        time.sleep(240)
-        try:
-            c = server.db()
-            c.execute("SELECT 1").fetchone()
-            c.close()
-        except Exception:
-            time.sleep(5)
-
-threading.Thread(target=_warm_loop, daemon=True).start()
 
 
 class handler(server.Handler):
