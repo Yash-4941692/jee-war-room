@@ -1391,8 +1391,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def chapter_patch(self, c, uid, cid, body):
         r = c.execute("SELECT * FROM chapters WHERE id=? AND user_id=?", (cid, uid)).fetchone()
         if not r: return self._err("Chapter not found", 404)
-        if body.get("status") in ("not_started", "in_progress", "completed", "revision_needed"):
-            c.execute("UPDATE chapters SET status=? WHERE id=?", (body["status"], cid))
+        new_st = body.get("status")
+        old_st = r["status"]
+        if new_st in ("not_started", "in_progress", "completed", "revision_needed"):
+            c.execute("UPDATE chapters SET status=? WHERE id=?", (new_st, cid))
+            if new_st in ("completed", "in_progress") and old_st != new_st:
+                today_act = c.execute("SELECT 1 FROM activities WHERE user_id=? AND chapter=? AND day=?",
+                                      (uid, r["name"], TODAY())).fetchone()
+                if not today_act:
+                    c.execute("""INSERT INTO activities(user_id,type,subject,chapter,amount,duration,extra,note,day,created_at)
+                        VALUES(?,?,?,?,0,30,?,?,?,?)""",
+                        (uid, "study", r["subject"], r["name"], "Syllabus progress", f"Chapter {new_st.replace('_',' ')}: {r['name']}", TODAY(), now_iso()))
+                if new_st == "completed" and old_st != "completed":
+                    s = get_settings(c, uid)
+                    add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
         if "name" in body:
             nm = (body["name"] or "").strip()[:80]
             if nm: c.execute("UPDATE chapters SET name=? WHERE id=?", (nm, cid))
@@ -1410,8 +1422,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tot = r["lectures_total"]
                 if tot and done > tot: done = tot
                 c.execute("UPDATE chapters SET lectures_done=? WHERE id=?", (done, cid))
-                if tot and done >= tot:
+                if tot and done >= tot and r["status"] != "completed":
                     c.execute("UPDATE chapters SET status='completed' WHERE id=?", (cid,))
+                    today_act = c.execute("SELECT 1 FROM activities WHERE user_id=? AND chapter=? AND day=?",
+                                          (uid, r["name"], TODAY())).fetchone()
+                    if not today_act:
+                        c.execute("""INSERT INTO activities(user_id,type,subject,chapter,amount,duration,extra,note,day,created_at)
+                            VALUES(?,?,?,?,0,30,?,?,?,?)""",
+                            (uid, "study", r["subject"], r["name"], "Syllabus progress", f"Chapter completed: {r['name']}", TODAY(), now_iso()))
+                    s = get_settings(c, uid)
+                    add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
                 elif done > 0 and r["status"] == "not_started":
                     c.execute("UPDATE chapters SET status='in_progress' WHERE id=?", (cid,))
             except Exception: pass
