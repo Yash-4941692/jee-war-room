@@ -16,6 +16,9 @@
   <div class="auth-card">
     <div class="auth-logo">🎯 <span>JEE WAR ROOM</span></div>
     <div class="auth-sub">Two aspirants. One mission. No excuses.</div>
+        <div style="text-align:center;margin:4px 0 14px">
+          <a href="/tour.html" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,122,26,0.12);border:1px solid rgba(255,122,26,0.3);color:var(--accent);font-size:11.5px;font-weight:700;padding:5px 12px;border-radius:999px;text-decoration:none">🎬 WATCH 1-MIN AI TOUR &amp; EXPLAINER →</a>
+        </div>
     <div class="auth-tabs">
       <button id="tab-login" class="at active" onclick="App.authTab('login')">LOGIN</button>
       <button id="tab-signup" class="at" onclick="App.authTab('signup')">SIGN UP</button>
@@ -55,13 +58,14 @@
 <div id="app" class="app hidden">
   <aside class="sidenav" id="sidenav"></aside>
   <div class="main">
-    <header class="topbar">
-      <div class="brand">🎯 <b>JEE WAR ROOM</b></div>
-      <div class="top-actions">
-        <div class="countdown-chip" id="countdown-chip"></div>
-        <button class="log-btn top" onclick="App.openLog()">＋ LOG ACTIVITY</button>
-      </div>
-    </header>
+        <header class="topbar">
+          <div class="brand">🎯 <b>JEE WAR ROOM</b></div>
+          <div class="top-actions">
+            <a href="/tour.html" class="tour-top-link" title="Watch AI Explainer Video Tour" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,122,26,0.12);border:1px solid rgba(255,122,26,0.3);color:var(--accent);font-size:11.5px;font-weight:700;padding:5px 10px;border-radius:8px;text-decoration:none">🎬 TOUR</a>
+            <div class="countdown-chip" id="countdown-chip"></div>
+            <button class="log-btn top" onclick="App.openLog()">＋ LOG ACTIVITY</button>
+          </div>
+        </header>
     <main id="view" class="view"></main>
   </div>
   <nav class="bottomnav" id="bottomnav"></nav>
