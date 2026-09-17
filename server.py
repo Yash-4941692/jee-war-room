@@ -380,25 +380,58 @@ def xp_total(c, uid):
     return c.execute("SELECT COALESCE(SUM(amount),0) v FROM xp_events WHERE user_id=?", (uid,)).fetchone()["v"]
 
 def streak_info(c, uid, s):
-    """Consecutive days (ending today or yesterday) meeting target threshold."""
+    """Consecutive active study days (ending today or yesterday).
+    A day counts towards streak if the student logged study activities,
+    focus sessions, mocks, or completed targets."""
     thr = s.get("streakThreshold", 70) / 100.0
-    rows = c.execute("SELECT day, status FROM targets WHERE user_id=? ORDER BY day DESC LIMIT 400", (uid,)).fetchall()
-    days = defaultdict(lambda: [0, 0.0])
-    for r in rows:
-        days[r["day"]][0] += 1
-        if r["status"] == "done": days[r["day"]][1] += 1
-        elif r["status"] == "partial": days[r["day"]][1] += 0.5
-    streak = 0; cur = datetime.now(IST).date()
-    # if today not yet successful, streak can still be alive from yesterday
-    tod = days.get(DAY_F(cur))
-    if not tod or tod[0] == 0 or tod[1] / tod[0] < thr:
+    # 1. Days with study activities (lectures, revision, pyqs, dpp, homework, study)
+    rows_act = c.execute("""
+        SELECT DISTINCT day FROM activities 
+        WHERE user_id=? AND type!='distraction'
+    """, (uid,)).fetchall()
+    active_days = {r["day"] if hasattr(r, "keys") else r[0] for r in rows_act}
+
+    # 2. Days with mock tests
+    rows_mock = c.execute("SELECT DISTINCT day FROM mocks WHERE user_id=?", (uid,)).fetchall()
+    active_days |= {r["day"] if hasattr(r, "keys") else r[0] for r in rows_mock}
+
+    # 3. Days with targets completed (status done/partial, or meeting streakThreshold)
+    rows_tar = c.execute("""
+        SELECT day, status FROM targets 
+        WHERE user_id=? ORDER BY day DESC LIMIT 400
+    """, (uid,)).fetchall()
+    t_days = defaultdict(lambda: [0, 0.0])
+    for r in rows_tar:
+        day = r["day"] if hasattr(r, "keys") else r[0]
+        st = r["status"] if hasattr(r, "keys") else r[1]
+        t_days[day][0] += 1
+        if st == "done":
+            t_days[day][1] += 1
+            active_days.add(day)
+        elif st == "partial":
+            t_days[day][1] += 0.5
+            active_days.add(day)
+
+    for day, (tot, done) in t_days.items():
+        if tot > 0 and (done / tot) >= thr:
+            active_days.add(day)
+
+    today_dt = datetime.now(IST).date()
+    today_str = DAY_F(today_dt)
+    yest_str = DAY_F(today_dt - timedelta(days=1))
+
+    streak = 0
+    if today_str in active_days:
+        cur = today_dt
+    elif yest_str in active_days:
+        cur = today_dt - timedelta(days=1)
+    else:
+        cur = None
+
+    while cur is not None and DAY_F(cur) in active_days:
+        streak += 1
         cur -= timedelta(days=1)
-    while True:
-        d = days.get(DAY_F(cur))
-        if d and d[0] > 0 and d[1] / d[0] >= thr:
-            streak += 1; cur -= timedelta(days=1)
-        else:
-            break
+
     best = max(s.get("bestStreak", 0), streak)
     if best != s.get("bestStreak", 0):
         s["bestStreak"] = best
@@ -882,7 +915,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # streak at risk
         st = streak_info(c, uid, s)
         if st["current"] == 0:
-            tips.append("You have no active streak. Hit 70% of today's targets to restart it.")
+            tips.append("You have no active streak. Log study time, complete a target, or take a mock to restart it.")
         return tips[:5]
 
     def _export(self, c, uid):
