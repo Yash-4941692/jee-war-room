@@ -222,15 +222,58 @@ function authTab(t){
   $("#auth-err").textContent=""; state.authMode=t;
 }
 function forgotPasswordModal(){
-  modal(`${mHead("🔑 Password Reset")}
-    <div style="line-height:1.6;font-size:14px;margin-bottom:14px">
-      Passwords in JEE War Room are one-way encrypted for privacy — nobody can read your current password.
+  const curName = ($("#auth-name")?.value || "").trim();
+  modal(`${mHead("🔑 Reset Password")}
+    <div style="font-size:13px;line-height:1.5;margin-bottom:12px">
+      Forgot your password? Enter your username and your 6-letter friend code to set a new password.
     </div>
-    <div class="summary-box" style="margin-bottom:14px">
-      <span class="big-e">👑</span>
-      <div><b>Ask Yash (Admin)</b><br><span class="muted sm">Ask Yash to reset your password. He can set a new one for your account in seconds from Settings → Registered Users.</span></div>
+    <div class="m-step-lab">YOUR USERNAME</div>
+    <input id="rp-name" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="e.g. Yash" value="${esc(curName)}">
+    <div class="m-step-lab">YOUR 6-LETTER FRIEND CODE</div>
+    <input id="rp-code" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px;text-transform:uppercase" placeholder="e.g. ALYWAY" maxlength="10">
+    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
+    <input id="rp-pass" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="New password">
+    <div class="m-step-lab">CONFIRM NEW PASSWORD</div>
+    <input id="rp-conf" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="Re-enter new password">
+    <div id="rp-err" class="auth-err" style="margin-bottom:8px"></div>
+    <div class="muted sm" style="margin-bottom:14px;line-height:1.4">
+      💡 Don't remember your 6-letter code? Ask Yash (Admin) to reset your password from Settings → Registered Users.
     </div>
-    <button class="btn-primary full" onclick="App.closeModal()">GOT IT</button>`);
+    <div class="flex" style="gap:8px">
+      <button class="btn full" onclick="App.closeModal()">CANCEL</button>
+      <button class="btn-primary full" id="rp-submit-btn" onclick="App.submitResetPassword()">RESET PASSWORD</button>
+    </div>`);
+  setTimeout(()=>{
+    const el = document.getElementById(curName ? "rp-code" : "rp-name");
+    if(el) el.focus();
+  }, 120);
+}
+
+async function submitResetPassword(){
+  const name = ($("#rp-name")?.value || "").trim();
+  const code = ($("#rp-code")?.value || "").trim().toUpperCase();
+  const pass = ($("#rp-pass")?.value || "").trim();
+  const conf = ($("#rp-conf")?.value || "").trim();
+  const err = $("#rp-err");
+  if(!name){ if(err) err.textContent="Please enter your username."; return; }
+  if(!code){ if(err) err.textContent="Please enter your 6-letter friend code."; return; }
+  if(pass.length < 4){ if(err) err.textContent="Password must be at least 4 characters."; return; }
+  if(pass !== conf){ if(err) err.textContent="Passwords do not match."; return; }
+  const btn = $("#rp-submit-btn");
+  if(btn){ btn.disabled = true; btn.textContent = "RESETTING…"; }
+  try{
+    await warmUpServer();
+    const r = await api("/api/auth/reset-password", { name, code, newPassword: pass });
+    if(r.token) setToken(r.token);
+    closeModal();
+    toast("Password reset! Logging in…", "good");
+    await reloadMe(true);
+    enterApp();
+  }catch(e){
+    if(btn){ btn.disabled = false; btn.textContent = "RESET PASSWORD"; }
+    if(err) err.textContent = e.message;
+    toast(e.message, "bad");
+  }
 }
 async function authSubmit(ev){
   ev.preventDefault();
@@ -2209,7 +2252,7 @@ return {
   toggleActivity, addActivity, removeActivity, addMetric, toggleMetric, moveMetric, removeMetric,
   addTemplate, editTemplate, saveTemplate, removeTemplate, saveXP, saveWeights, exportData, wipeData,
   dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw, saveAdminPw,
-  changePasswordModal, saveMyPassword, forgotPasswordModal,
+  changePasswordModal, saveMyPassword, forgotPasswordModal, submitResetPassword,
   sendReport, resolveReport,
   beginTimer,
 };

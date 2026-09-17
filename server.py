@@ -721,8 +721,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pu = c.execute("SELECT * FROM users WHERE id=?", (pid,)).fetchone()
         if not pu: return None
         ps = get_settings(c, pid); sh = ps["sharing"]
-        sweep_targets(c, pid, ps); save_settings(c, pid, ps)
-        ensure_snapshots(c, pid, ps)
         out = {"connected": True, "uid": pid, "name": pu["name"], "avatarColor": pu["avatar_color"],
                "examDate": pu["exam_date"], "code": pu["code"],
                "unread": c.execute(f"SELECT COUNT(*) n FROM messages WHERE recipient=? AND sender=? AND read_at IS NULL AND {msg_visible(uid)}",
@@ -900,6 +898,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # auth-free
         if p == "/api/auth/signup": return self.signup(body)
         if p == "/api/auth/login": return self.login(body)
+        if p == "/api/auth/reset-password": return self.reset_password(body)
         c = db(); uid = user["id"]; s = get_settings(c, uid)
         sweep_targets(c, uid, s)
         try:
@@ -1008,6 +1007,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._err("Wrong name or password.", 401)
             token = self._make_session(c, u["id"])
             return self._send({"ok": True, "token": token},
+                              extra_headers=[("Set-Cookie", self._cookie_header(token))])
+        finally:
+            c.close()
+
+    def reset_password(self, body):
+        name = (body.get("name") or "").strip()
+        code = (body.get("code") or "").strip().upper()
+        newpw = (body.get("newPassword") or "").strip()
+        if not name: return self._err("Enter your name.")
+        if not code: return self._err("Enter your 6-letter friend code.")
+        if len(newpw) < 4: return self._err("New password must be at least 4 characters.")
+        c = db()
+        try:
+            u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+            if not u: return self._err("No account found with that name.", 404)
+            if (u["code"] or "").strip().upper() != code:
+                return self._err("Incorrect 6-letter friend code for this account.", 400)
+            salt = hashlib.sha256(os.urandom(16)).hexdigest()
+            c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?",
+                      (hash_pw(newpw, salt), salt, u["id"]))
+            c.commit()
+            token = self._make_session(c, u["id"])
+            return self._send({"ok": True, "token": token, "name": u["name"]},
                               extra_headers=[("Set-Cookie", self._cookie_header(token))])
         finally:
             c.close()
