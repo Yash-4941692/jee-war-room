@@ -377,7 +377,8 @@ function buildNav(){
   const badge = n => n.id==="chat" && unread ? `<span class="nav-badge">${unread}</span>` : "";
   $("#bottomnav").innerHTML = NAV.map(n=>`<button class="bn ${state.view===n.id?'active':''}" onclick="App.go('${n.id}')"><span class="ic">${n.ic}${badge(n)}</span>${n.l}</button>`).join("");
   const snLinks = NAV.map(n=>`<button class="sn ${state.view===n.id?'active':''}" onclick="App.go('${n.id}')"><span class="ic">${n.ic}</span><span class="sn-label">${n.l}</span>${badge(n)}</button>`).join("");
-  $("#sidenav").innerHTML = `<div class="sn-logo">🎯 <b>JEE WAR ROOM</b></div>${snLinks}
+   $("#sidenav").innerHTML = `<div class="sn-logo">🎯 <b>JEE WAR ROOM</b></div>${snLinks}
+    <a href="/tour.html" class="sn" style="color:var(--accent);text-decoration:none;margin-top:4px"><span class="ic">🎬</span><span class="sn-label">Video Tour</span></a>
     <div class="sn-spacer"></div>
     <div class="sn-credit">Made by <b>Yash Sharma</b> 🎯</div>
     <div class="sn-user">${av(u.name,u.avatar_color,30)}<div style="min-width:0"><div style="font-weight:700;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(u.name)}</div>
