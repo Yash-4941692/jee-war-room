@@ -39,7 +39,7 @@ const nonce = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()
 const fmtMins = m => { m = Math.round(m||0); const h = Math.floor(m/60); return h ? `${h}h ${m%60}m` : `${m}m`; };
 const fmtAIR = n => Number(n).toLocaleString("en-IN");
 const fmtDate = d => new Date(d+"T00:00").toLocaleDateString(undefined,{weekday:"short",day:"numeric",month:"short"});
-const today = () => new Date().toISOString().slice(0,10);
+const today = () => { const d=new Date(); return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10); };
 function toast(msg, kind=""){
   const t = document.createElement("div"); t.className = "toast "+kind; t.textContent = msg;
   $("#toast-root").appendChild(t); setTimeout(()=>t.remove(), 3200);
@@ -51,24 +51,23 @@ async function api(path, body){
   const opt = {method:"GET", headers:{}, credentials:"same-origin"};
   const tok = getToken(); if(tok) opt.headers["Authorization"] = "Bearer " + tok;
   if(body !== undefined){ opt.method="POST"; opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
-  // Never hang forever on a cold database wake; GETs transparently retry
-  // (a cold Turso wake can take ~15-20s; by the retry it is warm). Retries
-  // also absorb the 1-2 s window during an atomic deploy so users never see
+  // Never hang forever on a cold database wake; transparently retry
+  // Retries also absorb the 1-2 s window during an atomic deploy so users never see
   // a "Connection lost" banner while an update is swapping over.
   const isGet = body===undefined;
   let r, d={}, tries=0;
   while(true){
-    opt.signal = AbortSignal.timeout(isGet ? 15000 : 20000);
+    opt.signal = AbortSignal.timeout(isGet ? 15000 : 25000);
     try{
       r = await fetch(path, opt);
       // a draining server during an atomic deploy gives brief 502/503/504 — retry, don't scare anyone
-      if(isGet && r.status>=502 && r.status<=504 && tries<2){
+      if(r.status>=502 && r.status<=504 && tries<2){
         throw new Error("retryable");
       }
       break;
     }catch(e){
       tries++;
-      if(isGet && tries<3){ await new Promise(res=>setTimeout(res, tries*1800)); continue; }
+      if(tries<3 && (isGet || tries<=2)){ await new Promise(res=>setTimeout(res, tries*1200)); continue; }
       bumpFails();
       if(consecutiveFails()>=2) setOffline(true);
       throw new Error(e.name==="TimeoutError" ? "Server is warming up — please retry in a few seconds."
@@ -184,8 +183,11 @@ function ringSVG(pct, size=96, color="#22d3ee", txt="", sub=""){
 
 /* ---------------- boot / auth ---------------- */
 async function init(){
+  if(!getToken()){
+    showAuth();
+    return;
+  }
   try{
-    await warmUpServer();
     await reloadMe(true);
     try{ await loadChapters(true); }catch(e){}
     enterApp();
@@ -200,12 +202,12 @@ async function warmUpServer(){
   for(let i=0;i<2;i++){
     try{
       const ctrl=new AbortController();
-      const to=setTimeout(()=>ctrl.abort(),40000);
+      const to=setTimeout(()=>ctrl.abort(),15000);
       const r=await fetch("/healthz?detail=1",{signal:ctrl.signal,cache:"no-store"});
       clearTimeout(to);
       if(r.ok){ state.warm=true; return true; }
-    }catch(e){ /* waking; one more long-poll attempt */ }
-    await new Promise(res=>setTimeout(res,1500));
+    }catch(e){ /* waking; one more attempt */ }
+    await new Promise(res=>setTimeout(res,1000));
   }
   return false; // let normal calls proceed; they have their own retries
 }
