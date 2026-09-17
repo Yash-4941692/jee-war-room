@@ -1,0 +1,1301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0d13">
+<title>JEE WAR ROOM — Official Explainer Video Tour</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
+<link rel="stylesheet" href="/styles.css?v=22">
+<style>
+/* ============ TOUR PLAYER STYLES ============ */
+body {
+  background: #07090e;
+  color: #e8edf5;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  user-select: none;
+}
+.tour-container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.tour-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0 16px;
+}
+.tour-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--txt);
+  text-decoration: none;
+  transition: all .15s ease;
+}
+.tour-back:hover {
+  border-color: var(--accent);
+  background: var(--card3);
+}
+.tour-badge {
+  background: rgba(255,122,26,.15);
+  border: 1px solid rgba(255,122,26,.3);
+  color: var(--accent);
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .5px;
+}
+.player-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: radial-gradient(1200px 700px at 50% 10%, rgba(255,122,26,.1), #0a0d13 70%);
+  border: 1px solid var(--border2);
+  border-radius: 18px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,.6), 0 0 40px rgba(255,122,26,.06);
+  display: flex;
+  flex-direction: column;
+}
+.stage {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.scene {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .45s ease, transform .45s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: scale(0.98);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 36px;
+  box-sizing: border-box;
+}
+.scene.active {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1);
+}
+.scene-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.scene-tag {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.scene-title {
+  font-size: 26px;
+  font-weight: 800;
+  margin: 0;
+  letter-spacing: -.5px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.scene-desc {
+  color: var(--muted);
+  font-size: 13.5px;
+  margin: 4px 0 16px;
+  max-width: 680px;
+  line-height: 1.4;
+}
+.scene-content {
+  flex: 1;
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+/* Subtitles bar */
+.subtitles-box {
+  position: absolute;
+  bottom: 60px;
+  left: 20px;
+  right: 20px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 10;
+}
+.subtitle-text {
+  background: rgba(10, 13, 19, 0.94);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border2);
+  padding: 10px 20px;
+  border-radius: 12px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: #fff;
+  text-align: center;
+  max-width: 800px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.6);
+  line-height: 1.45;
+  animation: fadeIn .3s ease;
+}
+.subtitle-text b {
+  color: var(--accent);
+}
+
+/* Player controls */
+.controls-bar {
+  background: rgba(13, 17, 25, 0.96);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border);
+  padding: 10px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 20;
+}
+.timeline-wrap {
+  width: 100%;
+  height: 6px;
+  background: rgba(255,255,255,.08);
+  border-radius: 999px;
+  position: relative;
+  cursor: pointer;
+}
+.timeline-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 999px;
+  width: 0%;
+  transition: width .1s linear;
+}
+.timeline-markers {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+}
+.timeline-mark {
+  width: 2px;
+  height: 100%;
+  background: rgba(0,0,0,.5);
+}
+.ctrl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ctrl-left, .ctrl-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ctrl-btn {
+  background: var(--card2);
+  border: 1px solid var(--border);
+  color: var(--txt);
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.ctrl-btn:hover {
+  background: var(--card3);
+  border-color: var(--border2);
+}
+.ctrl-btn.active {
+  background: rgba(255,122,26,.15);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.play-btn {
+  background: var(--accent);
+  color: #1a1005;
+  border: none;
+  font-weight: 800;
+  padding: 8px 16px;
+  border-radius: 9px;
+  font-size: 13.5px;
+}
+.play-btn:hover {
+  background: var(--accent2);
+}
+.time-display {
+  font-size: 12.5px;
+  font-family: monospace;
+  color: var(--muted);
+}
+.scene-pills {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.scene-pill {
+  flex: 1;
+  min-width: 140px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  border-radius: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: all .2s ease;
+}
+.scene-pill:hover {
+  border-color: var(--border2);
+  background: var(--card2);
+}
+.scene-pill.active {
+  background: var(--card2);
+  border-color: var(--accent);
+  box-shadow: 0 4px 16px rgba(255,122,26,.15);
+}
+.scene-pill .num {
+  font-size: 10.5px;
+  font-weight: 800;
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+.scene-pill.active .num {
+  color: var(--accent);
+}
+.scene-pill .label {
+  font-size: 12.5px;
+  font-weight: 700;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Big center play overlay with poster */
+.big-play-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(rgba(10,13,19,0.7), rgba(10,13,19,0.88)), url('/images/tour-thumbnail.png') center/cover no-repeat;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  cursor: pointer;
+  z-index: 30;
+  transition: opacity .35s ease;
+}
+.big-play-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+.big-play-circle {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #1a1005;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 34px;
+  box-shadow: 0 0 40px rgba(255,122,26,.6);
+  padding-left: 6px;
+  transition: transform .2s ease;
+}
+.big-play-overlay:hover .big-play-circle {
+  transform: scale(1.1);
+}
+.big-play-text {
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: .5px;
+  text-shadow: 0 2px 10px rgba(0,0,0,.8);
+}
+.big-play-sub {
+  font-size: 13.5px;
+  color: #cbd5e1;
+  text-shadow: 0 1px 6px rgba(0,0,0,.8);
+}
+
+/* UI MOCK STYLES FOR SCENES */
+.mock-window {
+  background: var(--card);
+  border: 1px solid var(--border2);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 860px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: floatUp .45s ease;
+}
+.mock-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+.mock-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.mock-card {
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+}
+.mock-card b {
+  color: var(--txt);
+  font-size: 14px;
+}
+.mock-val {
+  font-size: 24px;
+  font-weight: 800;
+  margin-top: 4px;
+}
+.highlight-pulse {
+  animation: borderGlow 2.5s infinite alternate;
+}
+@keyframes borderGlow {
+  0% { border-color: rgba(255,122,26,.3); box-shadow: 0 0 10px rgba(255,122,26,.1); }
+  100% { border-color: rgba(255,122,26,.9); box-shadow: 0 0 25px rgba(255,122,26,.35); }
+}
+@keyframes floatUp {
+  0% { opacity: 0; transform: translateY(10px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+/* Export status modal */
+.export-banner {
+  display: none;
+  background: rgba(34, 211, 238, 0.15);
+  border: 1px solid var(--cyan);
+  color: var(--cyan);
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+  margin-bottom: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+</style>
+</head>
+<body>
+
+<div class="tour-container">
+  <div class="tour-header">
+    <a href="/" class="tour-back">← Back to War Room</a>
+    <div style="font-weight:800;font-size:16px;display:flex;align-items:center;gap:6px">
+      🎯 <span>JEE WAR ROOM <span style="color:var(--accent)">EXPLAINER</span></span>
+    </div>
+    <div class="tour-badge">AI STUDIO NARRATION</div>
+  </div>
+
+  <div class="export-banner" id="export-banner">
+    <span id="export-status">Recording video stream in progress…</span>
+    <button class="ctrl-btn" onclick="Tour.cancelRecording()" style="padding:4px 8px;font-size:11px">Stop</button>
+  </div>
+
+  <!-- PLAYER FRAME -->
+  <div class="player-frame" id="player">
+    <div class="stage">
+
+      <!-- SCENE 1: THE MISSION -->
+      <div class="scene active" id="scene-1">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 1 of 6 · The Problem & Mission</span>
+          <span class="muted" style="font-size:12px">jee-war-room-three.vercel.app</span>
+        </div>
+        <h2 class="scene-title">🎯 The Accountability Headquarters</h2>
+        <div class="scene-desc">Most JEE aspirants don't fail from lack of study material. They fail from lack of daily accountability.</div>
+        <div class="scene-content">
+          <div class="mock-window highlight-pulse">
+            <div class="mock-topbar">
+              <div class="brand">🎯 <b>JEE WAR ROOM</b></div>
+              <div class="countdown-chip">JEE MAIN 2027 · <b>125 DAYS TO GO</b></div>
+            </div>
+            <div class="hero" style="margin:8px 0;padding:16px;border-radius:14px">
+              <div class="kick">THE TWO-ASPIRANT PLEDGE</div>
+              <div style="font-size:22px;font-weight:800;margin:6px 0">Plan → Execute → Log → Analyze → Improve</div>
+              <div class="muted" style="font-size:13px">No distracting reels. No public clutter. Pure private execution.</div>
+            </div>
+            <div class="mock-grid">
+              <div class="mock-card"><span class="muted sm">61 CHAPTERS</span><div class="mock-val" style="color:var(--cyan)">PCM Ready</div></div>
+              <div class="mock-card"><span class="muted sm">PROJECTED AIR</span><div class="mock-val" style="color:var(--accent)">Trajectory</div></div>
+              <div class="mock-card"><span class="muted sm">1:1 DUELS</span><div class="mock-val" style="color:var(--lime)">Live Chat</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCENE 2: DAILY TARGETS & FOCUS TIMER -->
+      <div class="scene" id="scene-2">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 2 of 6 · Daily Execution</span>
+          <span class="muted" style="font-size:12px">Plan → Execute → Log</span>
+        </div>
+        <h2 class="scene-title">⏱️ Targets, Day Templates & Anti-Drift Timer</h2>
+        <div class="scene-desc">Load day templates in one tap. Run full-screen focus sessions with wall-clock verification.</div>
+        <div class="scene-content">
+          <div class="mock-window">
+            <div style="display:flex;gap:16px;align-items:center">
+              <div style="flex:1">
+                <div style="font-size:11px;font-weight:700;color:var(--muted);letter-spacing:1px;margin-bottom:8px">QUICK DAY TEMPLATES</div>
+                <div style="display:flex;gap:8px;margin-bottom:12px">
+                  <div class="ctrl-btn active">⚡ Normal Day</div>
+                  <div class="ctrl-btn">⚡ Heavy Practice</div>
+                  <div class="ctrl-btn">⚡ Revision Day</div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px">
+                  <div class="mock-card" style="display:flex;justify-content:space-between;align-items:center">
+                    <div><b>Rotational Motion — 50 PYQs</b><br><span class="muted sm">Physics · Practice</span></div>
+                    <span style="color:var(--green);font-weight:800">✓ DONE</span>
+                  </div>
+                  <div class="mock-card" style="display:flex;justify-content:space-between;align-items:center">
+                    <div><b>Chemical Bonding — Revision Slot</b><br><span class="muted sm">Chemistry · 45 mins</span></div>
+                    <span style="color:var(--green);font-weight:800">✓ DONE</span>
+                  </div>
+                  <div class="mock-card" style="display:flex;justify-content:space-between;align-items:center">
+                    <div><b>Definite Integration — 3 DPPs</b><br><span class="muted sm">Maths · 30 questions</span></div>
+                    <span style="color:var(--accent);font-weight:800">IN PROGRESS</span>
+                  </div>
+                </div>
+              </div>
+              <div style="width:230px;background:var(--card2);border:1px solid var(--border);border-radius:14px;padding:16px;text-align:center">
+                <div style="font-size:11px;font-weight:800;letter-spacing:1px;color:var(--accent)">FOCUS TIMER</div>
+                <div style="font-size:42px;font-weight:900;color:var(--txt);margin:8px 0;letter-spacing:-1px">24:45</div>
+                <div class="muted sm">Rotational Motion PYQs</div>
+                <div style="margin-top:12px;background:rgba(163,230,53,.15);color:var(--lime);padding:4px 10px;border-radius:999px;font-size:11px;font-weight:800">
+                  🔥 ANTI-DRIFT VERIFIED
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCENE 3: 61-CHAPTER SYLLABUS -->
+      <div class="scene" id="scene-3">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 3 of 6 · Syllabus Tracker & XP</span>
+          <span class="muted" style="font-size:12px">Physics · Chemistry · Mathematics</span>
+        </div>
+        <h2 class="scene-title">📚 61 Chapters Tracker & XP Gamification</h2>
+        <div class="scene-desc">Every lecture and chapter finished awards XP, leveling your status from Starting Line to Relentless.</div>
+        <div class="scene-content">
+          <div class="mock-window">
+            <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding-bottom:10px">
+              <div style="display:flex;gap:8px">
+                <button class="ctrl-btn active">⚛️ Physics (20)</button>
+                <button class="ctrl-btn">🧪 Chemistry (21)</button>
+                <button class="ctrl-btn">📐 Maths (20)</button>
+              </div>
+              <div style="background:rgba(255,122,26,.15);border:1px solid var(--accent);color:var(--accent);padding:4px 12px;border-radius:8px;font-weight:800;font-size:12px">
+                LEVEL 4 · RELENTLESS (650 XP)
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
+              <div class="mock-card">
+                <div style="display:flex;justify-content:space-between"><b>Electrostatics</b><span style="color:var(--green);font-weight:800">COMPLETED (+50 XP)</span></div>
+                <div class="muted sm" style="margin-top:4px">12/12 lectures done · PYQs solved</div>
+                <div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:8px"><div style="width:100%;height:100%;background:var(--green);border-radius:2px"></div></div>
+              </div>
+              <div class="mock-card">
+                <div style="display:flex;justify-content:space-between"><b>Current Electricity</b><span style="color:var(--cyan);font-weight:800">IN PROGRESS</span></div>
+                <div class="muted sm" style="margin-top:4px">8/10 lectures done · 2 remaining</div>
+                <div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:8px"><div style="width:80%;height:100%;background:var(--cyan);border-radius:2px"></div></div>
+              </div>
+              <div class="mock-card">
+                <div style="display:flex;justify-content:space-between"><b>Thermodynamics</b><span style="color:var(--yellow);font-weight:800">REVISION NEEDED</span></div>
+                <div class="muted sm" style="margin-top:4px">Formula sheet pending</div>
+                <div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:8px"><div style="width:90%;height:100%;background:var(--yellow);border-radius:2px"></div></div>
+              </div>
+              <div class="mock-card">
+                <div style="display:flex;justify-content:space-between"><b>Optics</b><span class="muted" style="font-weight:800">NOT STARTED</span></div>
+                <div class="muted sm" style="margin-top:4px">Scheduled for next week</div>
+                <div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin-top:8px"><div style="width:0%;height:100%;background:var(--muted);border-radius:2px"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCENE 4: PROJECTED AIR -->
+      <div class="scene" id="scene-4">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 4 of 6 · Deterministic Trajectory</span>
+          <span class="muted" style="font-size:12px">Pure Math · Zero Fluff</span>
+        </div>
+        <h2 class="scene-title">📈 Deterministic Projected AIR</h2>
+        <div class="scene-desc">Not a random rank guess. A mathematical model tracking 14-day study consistency, revision, and test accuracy.</div>
+        <div class="scene-content">
+          <div class="mock-window">
+            <div style="display:flex;gap:20px;align-items:center">
+              <div style="flex:1">
+                <div class="mock-card highlight-pulse" style="padding:16px">
+                  <span class="muted sm" style="letter-spacing:1px">PREPARATION TRAJECTORY</span>
+                  <div style="font-size:38px;font-weight:900;color:var(--accent);margin:6px 0;letter-spacing:-1px">
+                    AIR 14,250
+                  </div>
+                  <div style="color:var(--green);font-size:13px;font-weight:700">▲ Improved by 8,400 positions this week</div>
+                  <div class="muted sm" style="margin-top:6px;line-height:1.4">Based on 14-day consistency EMA with mock scores.</div>
+                </div>
+              </div>
+              <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+                <div class="mock-card" style="padding:8px 12px;display:flex;justify-content:space-between;font-size:13px">
+                  <span>Consistency (14d active)</span><b style="color:var(--green)">14 / 14 Days</b>
+                </div>
+                <div class="mock-card" style="padding:8px 12px;display:flex;justify-content:space-between;font-size:13px">
+                  <span>Target Execution</span><b style="color:var(--cyan)">88% Completion</b>
+                </div>
+                <div class="mock-card" style="padding:8px 12px;display:flex;justify-content:space-between;font-size:13px">
+                  <span>Questions Practice</span><b style="color:var(--lime)">385 PYQs/DPPs</b>
+                </div>
+                <div class="mock-card" style="padding:8px 12px;display:flex;justify-content:space-between;font-size:13px">
+                  <span>Phone Distraction Penalty</span><b style="color:var(--red)">-2.5 pts</b>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCENE 5: STUDY DUELS & CHAT -->
+      <div class="scene" id="scene-5">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 5 of 6 · Mutual Accountability</span>
+          <span class="muted" style="font-size:12px">Two Aspirants · 1:1 Live Sync</span>
+        </div>
+        <h2 class="scene-title">⚔️ Study Duels & Private 1:1 Chat</h2>
+        <div class="scene-desc">Connect with your study partner using a 6-letter friend code. Compete on 7-day hours and chat live.</div>
+        <div class="scene-content">
+          <div class="mock-window">
+            <div style="display:flex;gap:16px">
+              <div style="flex:1.2;background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:14px">
+                <div style="font-size:11px;font-weight:800;letter-spacing:1px;color:var(--accent);margin-bottom:8px">⚔️ 7-DAY DUEL STANDINGS</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+                  <div><b>You (Yash)</b><br><span class="muted sm">38h 20m focus · 410 Qs</span></div>
+                  <span style="color:var(--green);font-weight:900;font-size:18px">WINNING 👑</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
+                  <div><b>Study Buddy (Aman)</b><br><span class="muted sm">34h 10m focus · 380 Qs</span></div>
+                  <span class="muted sm" style="font-weight:800">-4h 10m behind</span>
+                </div>
+              </div>
+              <div style="flex:1;background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:12px;display:flex;flex-direction:column;justify-content:space-between">
+                <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:1px;margin-bottom:6px">💬 REAL-TIME CHAT</div>
+                <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
+                  <div style="align-self:flex-start;background:var(--card3);padding:6px 10px;border-radius:8px">Did you finish the Rotational test?</div>
+                  <div style="align-self:flex-end;background:var(--accent);color:#1a1005;font-weight:700;padding:6px 10px;border-radius:8px">Yes! 74/100. Doing error book now.</div>
+                  <div style="align-self:flex-start;background:var(--card3);padding:6px 10px;border-radius:8px">Awesome. Starting 2h Math slot 🔥</div>
+                </div>
+                <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px;font-size:11px;color:var(--green);font-weight:700">● Live sync connected</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SCENE 6: CALL TO ACTION -->
+      <div class="scene" id="scene-6">
+        <div class="scene-top">
+          <span class="scene-tag">Scene 6 of 6 · Get Started</span>
+          <span class="muted" style="font-size:12px">Free & Permanent</span>
+        </div>
+        <h2 class="scene-title">🎯 Enter The War Room Today</h2>
+        <div class="scene-desc">No credit cards. Permanent cloud storage. Zero distractions. Start planning your JEE preparation today.</div>
+        <div class="scene-content">
+          <div class="mock-window highlight-pulse" style="text-align:center;padding:26px">
+            <div style="font-size:48px">🎯</div>
+            <div style="font-size:24px;font-weight:900;margin:10px 0">jee-war-room-three.vercel.app</div>
+            <div class="muted" style="max-width:500px;margin:0 auto 18px;font-size:14px">
+              Created for serious aspirants who refuse to let another day slip away without execution.
+            </div>
+            <div style="display:flex;justify-content:center;gap:12px">
+              <a href="/" class="play-btn" style="text-decoration:none;font-size:14px;padding:12px 24px">ENTER THE WAR ROOM →</a>
+              <button class="ctrl-btn" onclick="Tour.replay()">↺ REPLAY TOUR</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- SUBTITLES OVERLAY -->
+    <div class="subtitles-box" id="subtitles-box">
+      <div class="subtitle-text" id="subtitle-text">
+        Loading audio narration…
+      </div>
+    </div>
+
+    <!-- BIG PLAY OVERLAY -->
+    <div class="big-play-overlay" id="big-play" onclick="Tour.togglePlay()">
+      <div class="big-play-circle">▶</div>
+      <div class="big-play-text">START EXPLAINER VIDEO TOUR</div>
+      <div class="big-play-sub">With Studio AI Voice Narration & Live UI Animations (1:22)</div>
+    </div>
+
+    <!-- CONTROLS BAR -->
+    <div class="controls-bar">
+      <div class="timeline-wrap" id="timeline" onclick="Tour.seek(event)">
+        <div class="timeline-progress" id="progress"></div>
+        <div class="timeline-markers">
+          <div class="timeline-mark"></div>
+          <div class="timeline-mark"></div>
+          <div class="timeline-mark"></div>
+          <div class="timeline-mark"></div>
+          <div class="timeline-mark"></div>
+          <div class="timeline-mark"></div>
+        </div>
+      </div>
+      <div class="ctrl-row">
+        <div class="ctrl-left">
+          <button class="play-btn" id="play-btn" onclick="Tour.togglePlay()">▶ PLAY</button>
+          <button class="ctrl-btn" onclick="Tour.prev()">⏮ Prev</button>
+          <button class="ctrl-btn" onclick="Tour.next()">Next ⏭</button>
+          <span class="time-display" id="time-display">0:00 / 1:22</span>
+        </div>
+        <div class="ctrl-right">
+          <button class="ctrl-btn" id="sub-btn" onclick="Tour.toggleSubtitles()">💬 CC</button>
+          <button class="ctrl-btn" id="mute-btn" onclick="Tour.toggleMute()">🔊</button>
+          <button class="ctrl-btn" onclick="Tour.downloadAudio()">📥 Audio MP3</button>
+          <button class="ctrl-btn" id="record-btn" onclick="Tour.recordAndDownload()">🎥 Export WebM</button>
+          <button class="ctrl-btn" onclick="Tour.toggleFullscreen()">⛶ Fullscreen</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCENE PILLS SELECTOR -->
+  <div class="scene-pills">
+    <div class="scene-pill active" onclick="Tour.goTo(0)">
+      <div class="num">SCENE 1</div>
+      <div class="label">🎯 The Mission</div>
+    </div>
+    <div class="scene-pill" onclick="Tour.goTo(1)">
+      <div class="num">SCENE 2</div>
+      <div class="label">⏱️ Daily Execution</div>
+    </div>
+    <div class="scene-pill" onclick="Tour.goTo(2)">
+      <div class="num">SCENE 3</div>
+      <div class="label">📚 61 Chapters & XP</div>
+    </div>
+    <div class="scene-pill" onclick="Tour.goTo(3)">
+      <div class="num">SCENE 4</div>
+      <div class="label">📈 Projected AIR</div>
+    </div>
+    <div class="scene-pill" onclick="Tour.goTo(4)">
+      <div class="num">SCENE 5</div>
+      <div class="label">⚔️ Duels & Chat</div>
+    </div>
+    <div class="scene-pill" onclick="Tour.goTo(5)">
+      <div class="num">SCENE 6</div>
+      <div class="label">🚀 Enter War Room</div>
+    </div>
+  </div>
+</div>
+
+<!-- HIDDEN CANVAS FOR HIGH-RES VIDEO EXPORT -->
+<canvas id="export-canvas" width="1280" height="720" style="display:none"></canvas>
+
+<script>
+const Tour = (() => {
+  "use strict";
+
+  const SCENES = [
+    {
+      id: "scene-1",
+      audio: "/audio/scene1_intro.mp3",
+      title: "The Mission & Accountability",
+      text: "Most JEE aspirants do not fail from a lack of study material. They fail from a lack of daily accountability. Welcome to JEE War Room. A private, distraction-free headquarters built specifically to help you plan, execute, analyze, and conquer JEE Main."
+    },
+    {
+      id: "scene-2",
+      audio: "/audio/scene2_daily.mp3",
+      title: "Daily Targets & Focus Timer",
+      text: "Every morning, plan your targets or load custom day templates like Practice Day or Revision Day in one tap. During study blocks, launch the full-screen Focus Timer with verified duration tracking to eliminate drifting and keep you in deep work."
+    },
+    {
+      id: "scene-3",
+      audio: "/audio/scene3_syllabus.mp3",
+      title: "61-Chapter PCM Syllabus Tracker",
+      text: "Track all sixty-one Physics, Chemistry, and Mathematics chapters from one clean syllabus hub. Log your lecture progress, mark completed chapters, and earn XP to level up your status from Starting Line to Relentless and Indomitable."
+    },
+    {
+      id: "scene-4",
+      audio: "/audio/scene4_air.mp3",
+      title: "Deterministic Projected AIR",
+      text: "Unlike random test predictors, your Projected AIR is a mathematical preparation trajectory. It rewards fourteen-day consistency, question practice, and revision balance, while penalizing phone distractions and missed targets."
+    },
+    {
+      id: "scene-5",
+      audio: "/audio/scene5_duels.mp3",
+      title: "1:1 Study Duels & Live Chat",
+      text: "Study alongside trusted friends using your private six-letter code. Challenge each other to study duels, compare seven-day focus minutes, and chat live in real-time to keep each other sharp and disciplined every single day."
+    },
+    {
+      id: "scene-6",
+      audio: "/audio/scene6_outro.mp3",
+      title: "Enter The War Room",
+      text: "Zero clutter, zero social media feeds, and lightning-fast performance. Two aspirants, one mission, and no excuses. Enter the War Room today at jee-war-room-three.vercel.app."
+    }
+  ];
+
+  let currentIdx = 0;
+  let isPlaying = false;
+  let isMuted = false;
+  let showCC = true;
+  let audioElement = new Audio();
+  let isRecording = false;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let animFrameId = null;
+
+  audioElement.preload = "auto";
+
+  function init() {
+    loadScene(0, false);
+    audioElement.addEventListener("ended", onSceneEnded);
+    audioElement.addEventListener("timeupdate", updateProgress);
+  }
+
+  function loadScene(idx, autoPlay = true) {
+    currentIdx = idx;
+    const scene = SCENES[idx];
+
+    // Update scene visibility
+    document.querySelectorAll(".scene").forEach((el, i) => {
+      el.classList.toggle("active", i === idx);
+    });
+
+    // Update scene pills
+    document.querySelectorAll(".scene-pill").forEach((el, i) => {
+      el.classList.toggle("active", i === idx);
+    });
+
+    // Update subtitles
+    const subEl = document.getElementById("subtitle-text");
+    if (subEl) {
+      subEl.textContent = scene.text;
+    }
+
+    // Load audio
+    audioElement.src = scene.audio;
+    audioElement.muted = isMuted;
+
+    audioElement.onerror = () => {
+      if (window.speechSynthesis && isPlaying) {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(scene.text);
+        utter.rate = 1.05;
+        utter.pitch = 0.95;
+        utter.onend = onSceneEnded;
+        window.speechSynthesis.speak(utter);
+      }
+    };
+
+    if (autoPlay) {
+      audioElement.play().then(() => {
+        setPlayState(true);
+      }).catch(() => {
+        if (window.speechSynthesis && isPlaying) {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(scene.text);
+          utter.rate = 1.05;
+          utter.pitch = 0.95;
+          utter.onend = onSceneEnded;
+          window.speechSynthesis.speak(utter);
+          setPlayState(true);
+        } else {
+          setPlayState(false);
+        }
+      });
+    }
+  }
+
+  function togglePlay() {
+    const bigPlay = document.getElementById("big-play");
+    if (bigPlay) bigPlay.classList.add("hidden");
+
+    if (isPlaying) {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+      audioElement.pause();
+      setPlayState(false);
+    } else {
+      audioElement.play().then(() => {
+        setPlayState(true);
+      }).catch(err => {
+        if (window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(SCENES[currentIdx].text);
+          utter.rate = 1.05;
+          utter.pitch = 0.95;
+          utter.onend = onSceneEnded;
+          window.speechSynthesis.speak(utter);
+          setPlayState(true);
+        } else {
+          setPlayState(false);
+        }
+      });
+    }
+  }
+
+  function setPlayState(playing) {
+    isPlaying = playing;
+    const btn = document.getElementById("play-btn");
+    if (btn) btn.textContent = playing ? "⏸ PAUSE" : "▶ PLAY";
+    const bigPlay = document.getElementById("big-play");
+    if (bigPlay && playing) bigPlay.classList.add("hidden");
+  }
+
+  function onSceneEnded() {
+    if (currentIdx < SCENES.length - 1) {
+      loadScene(currentIdx + 1, true);
+    } else {
+      setPlayState(false);
+      if (isRecording) {
+        stopRecordingAndDownload();
+      } else {
+        const bigPlay = document.getElementById("big-play");
+        if (bigPlay) {
+          bigPlay.classList.remove("hidden");
+          const textEl = document.querySelector(".big-play-text");
+          if (textEl) textEl.textContent = "TOUR FINISHED — REPLAY?";
+        }
+      }
+    }
+  }
+
+  function updateProgress() {
+    const cur = audioElement.currentTime || 0;
+    const dur = audioElement.duration || 1;
+    const pct = ((currentIdx + (cur / dur)) / SCENES.length) * 100;
+
+    const progEl = document.getElementById("progress");
+    if (progEl) progEl.style.width = Math.min(100, pct) + "%";
+
+    const totalEstSecs = 82; // ~1m 22s total
+    const elapsedSecs = Math.round((currentIdx / SCENES.length) * totalEstSecs + cur);
+    const timeEl = document.getElementById("time-display");
+    if (timeEl) {
+      timeEl.textContent = `${fmtTime(elapsedSecs)} / ${fmtTime(totalEstSecs)}`;
+    }
+  }
+
+  function fmtTime(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec < 10 ? '0' : ''}${sec}`;
+  }
+
+  function next() {
+    if (currentIdx < SCENES.length - 1) {
+      loadScene(currentIdx + 1, isPlaying);
+    }
+  }
+
+  function prev() {
+    if (audioElement.currentTime > 2) {
+      audioElement.currentTime = 0;
+    } else if (currentIdx > 0) {
+      loadScene(currentIdx - 1, isPlaying);
+    }
+  }
+
+  function goTo(idx) {
+    loadScene(idx, isPlaying);
+  }
+
+  function replay() {
+    loadScene(0, true);
+  }
+
+  function seek(e) {
+    const bar = document.getElementById("timeline");
+    const rect = bar.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const targetIdx = Math.min(SCENES.length - 1, Math.floor(ratio * SCENES.length));
+    loadScene(targetIdx, isPlaying);
+  }
+
+  function toggleMute() {
+    isMuted = !isMuted;
+    audioElement.muted = isMuted;
+    const btn = document.getElementById("mute-btn");
+    if (btn) btn.textContent = isMuted ? "🔇" : "🔊";
+  }
+
+  function toggleSubtitles() {
+    showCC = !showCC;
+    const box = document.getElementById("subtitles-box");
+    const btn = document.getElementById("sub-btn");
+    if (box) box.style.display = showCC ? "flex" : "none";
+    if (btn) btn.classList.toggle("active", showCC);
+  }
+
+  function toggleFullscreen() {
+    const el = document.getElementById("player");
+    if (!document.fullscreenElement) {
+      if (el.requestFullscreen) el.requestFullscreen();
+    } else {
+      if (document.exitFullscreen) document.exitFullscreen();
+    }
+  }
+
+  function downloadAudio() {
+    const a = document.createElement("a");
+    a.href = "/audio/full_narration.mp3";
+    a.download = "JEE-War-Room-Official-Narration.mp3";
+    a.click();
+  }
+
+  // Live Canvas Rendering for Recording
+  function drawFrameToCanvas(ctx, width, height) {
+    // Background gradient
+    const bg = ctx.createLinearGradient(0, 0, width, height);
+    bg.addColorStop(0, "#080b11");
+    bg.addColorStop(0.5, "#0d131c");
+    bg.addColorStop(1, "#07090e");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, width, height);
+
+    // Header bar
+    ctx.fillStyle = "#ff7a1a";
+    ctx.font = "bold 26px Inter, sans-serif";
+    ctx.fillText("🎯 JEE WAR ROOM", 60, 60);
+
+    ctx.fillStyle = "#8a96aa";
+    ctx.font = "600 16px Inter, sans-serif";
+    ctx.fillText("TWO ASPIRANTS. ONE MISSION. NO EXCUSES.", 300, 60);
+
+    // Current Scene info
+    const scene = SCENES[currentIdx];
+    ctx.fillStyle = "#ff7a1a";
+    ctx.font = "bold 18px Inter, sans-serif";
+    ctx.fillText(`SCENE ${currentIdx + 1} OF 6: ${scene.title.toUpperCase()}`, 60, 120);
+
+    // Card frame
+    ctx.fillStyle = "#121824";
+    ctx.strokeStyle = "#253046";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(60, 150, width - 120, height - 320, 16);
+    ctx.fill();
+    ctx.stroke();
+
+    // Visual elements per scene
+    if (currentIdx === 0) {
+      // Scene 1: Mission
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 32px Inter, sans-serif";
+      ctx.fillText("Private Accountability Headquarters", 100, 230);
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "18px Inter, sans-serif";
+      ctx.fillText("Built to eliminate drift, distractions, and excuses in JEE Main prep.", 100, 270);
+
+      // 3 feature boxes
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(100, 320, 320, 140);
+      ctx.fillRect(460, 320, 320, 140);
+      ctx.fillRect(820, 320, 320, 140);
+
+      ctx.fillStyle = "#22d3ee";
+      ctx.font = "bold 20px Inter, sans-serif";
+      ctx.fillText("61 PCM CHAPTERS", 120, 370);
+      ctx.fillStyle = "#ff7a1a";
+      ctx.fillText("PROJECTED AIR", 480, 370);
+      ctx.fillStyle = "#a3e635";
+      ctx.fillText("1:1 FOCUS DUELS", 840, 370);
+    } else if (currentIdx === 1) {
+      // Scene 2: Daily Execution
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 30px Inter, sans-serif";
+      ctx.fillText("Daily Targets & Verified Focus Timer", 100, 220);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(100, 260, 560, 220);
+      ctx.fillStyle = "#22d3ee";
+      ctx.font = "bold 18px Inter, sans-serif";
+      ctx.fillText("✓ Rotational Motion 50 PYQs", 130, 310);
+      ctx.fillText("✓ Chemical Bonding Revision", 130, 360);
+      ctx.fillStyle = "#ff7a1a";
+      ctx.fillText("▶ Definite Integration 3 DPPs", 130, 410);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(720, 260, 420, 220);
+      ctx.fillStyle = "#ff7a1a";
+      ctx.font = "bold 56px monospace";
+      ctx.fillText("24:45", 830, 370);
+      ctx.font = "bold 16px Inter, sans-serif";
+      ctx.fillStyle = "#a3e635";
+      ctx.fillText("🔥 ANTI-DRIFT VERIFIED", 820, 420);
+    } else if (currentIdx === 2) {
+      // Scene 3: 61 Chapters
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 30px Inter, sans-serif";
+      ctx.fillText("61 PCM Chapters & Gamified XP Leveling", 100, 220);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(100, 260, 500, 90);
+      ctx.fillRect(100, 380, 500, 90);
+      ctx.fillRect(640, 260, 500, 90);
+      ctx.fillRect(640, 380, 500, 90);
+
+      ctx.fillStyle = "#a3e635";
+      ctx.font = "bold 18px Inter, sans-serif";
+      ctx.fillText("⚛️ Electrostatics (12/12) — COMPLETED (+50 XP)", 120, 310);
+      ctx.fillStyle = "#22d3ee";
+      ctx.fillText("🧪 Chemical Bonding (8/10) — IN PROGRESS", 120, 430);
+      ctx.fillStyle = "#facc15";
+      ctx.fillText("📐 Calculus & Vectors — REVISION NEEDED", 660, 310);
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("⚛️ Modern Physics — SCHEDULED", 660, 430);
+    } else if (currentIdx === 3) {
+      // Scene 4: Projected AIR
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 30px Inter, sans-serif";
+      ctx.fillText("Deterministic Projected AIR Trajectory", 100, 220);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(100, 260, 450, 210);
+      ctx.fillStyle = "#ff7a1a";
+      ctx.font = "bold 48px Inter, sans-serif";
+      ctx.fillText("AIR 14,250", 140, 340);
+      ctx.font = "bold 16px Inter, sans-serif";
+      ctx.fillStyle = "#a3e635";
+      ctx.fillText("▲ Improved 8,400 positions this week", 140, 390);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(600, 260, 560, 210);
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "600 16px Inter, sans-serif";
+      ctx.fillText("• 14-Day Consistency: 100% active", 630, 310);
+      ctx.fillText("• Target Execution: 88% completed", 630, 350);
+      ctx.fillText("• DPP & PYQ Count: 385 questions", 630, 390);
+      ctx.fillStyle = "#f87171";
+      ctx.fillText("• Distraction Penalty: -2.5 pts", 630, 430);
+    } else if (currentIdx === 4) {
+      // Scene 5: Duels & Chat
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 30px Inter, sans-serif";
+      ctx.fillText("7-Day Study Duels & Private 1:1 Chat", 100, 220);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(100, 260, 500, 210);
+      ctx.fillStyle = "#ff7a1a";
+      ctx.font = "bold 20px Inter, sans-serif";
+      ctx.fillText("⚔️ 7-DAY DUEL: WINNING 👑", 130, 310);
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "16px Inter, sans-serif";
+      ctx.fillText("You: 38h 20m focus · 410 questions", 130, 360);
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText("Partner: 34h 10m focus · 380 questions", 130, 400);
+
+      ctx.fillStyle = "#182030";
+      ctx.fillRect(640, 260, 520, 210);
+      ctx.fillStyle = "#22d3ee";
+      ctx.font = "bold 16px Inter, sans-serif";
+      ctx.fillText("💬 Real-Time Study Chat", 670, 305);
+      ctx.fillStyle = "#cbd5e1";
+      ctx.fillText("Yash: Finished Rotational PYQs! Starting Math.", 670, 350);
+      ctx.fillText("Partner: Great, targeting 50 Integration Qs.", 670, 390);
+      ctx.fillStyle = "#a3e635";
+      ctx.fillText("● Live WebSocket connection active", 670, 435);
+    } else if (currentIdx === 5) {
+      // Scene 6: Call to Action
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 36px Inter, sans-serif";
+      ctx.fillText("Enter The War Room Today", 100, 240);
+
+      ctx.fillStyle = "#ff7a1a";
+      ctx.font = "bold 28px Inter, sans-serif";
+      ctx.fillText("jee-war-room-three.vercel.app", 100, 300);
+
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "20px Inter, sans-serif";
+      ctx.fillText("Zero clutter. Zero distractions. Two aspirants, one mission.", 100, 360);
+
+      ctx.fillStyle = "#22c55e";
+      ctx.font = "bold 22px Inter, sans-serif";
+      ctx.fillText("Free & Permanent Cloud Sync 🚀", 100, 420);
+    }
+
+    // Subtitles box at bottom
+    ctx.fillStyle = "rgba(10, 13, 19, 0.95)";
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(60, height - 140, width - 120, 95, 12);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "600 17px Inter, sans-serif";
+    ctx.textAlign = "center";
+    wrapText(ctx, scene.text, width / 2, height - 105, width - 180, 24);
+    ctx.textAlign = "left";
+  }
+
+  function wrapText(ctx, text, x, y, maxWidth, lineHeight) {
+    const words = text.split(" ");
+    let line = "";
+    for (let n = 0; n < words.length; n++) {
+      const testLine = line + words[n] + " ";
+      const metrics = ctx.measureText(testLine);
+      if (metrics.width > maxWidth && n > 0) {
+        ctx.fillText(line, x, y);
+        line = words[n] + " ";
+        y += lineHeight;
+      } else {
+        line = testLine;
+      }
+    }
+    ctx.fillText(line, x, y);
+  }
+
+  function recordAndDownload() {
+    if (isRecording) return;
+    const banner = document.getElementById("export-banner");
+    const status = document.getElementById("export-status");
+    if (banner) banner.style.display = "flex";
+    if (status) status.textContent = "Recording explainer video… (will auto-download when complete)";
+
+    isRecording = true;
+    recordedChunks = [];
+
+    const canvas = document.getElementById("export-canvas");
+    const ctx = canvas.getContext("2d");
+
+    // Start render loop
+    function loop() {
+      drawFrameToCanvas(ctx, canvas.width, canvas.height);
+      if (isRecording) {
+        animFrameId = requestAnimationFrame(loop);
+      }
+    }
+    animFrameId = requestAnimationFrame(loop);
+
+    // Audio context & destination
+    const canvasStream = canvas.captureStream(30);
+
+    let stream = canvasStream;
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const dest = audioCtx.createMediaStreamDestination();
+      const source = audioCtx.createMediaElementSource(audioElement);
+      source.connect(dest);
+      source.connect(audioCtx.destination);
+      stream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...dest.stream.getAudioTracks()
+      ]);
+    } catch (e) {
+      console.warn("Could not attach audio to MediaStream directly, exporting video track", e);
+    }
+
+    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+      ? "video/webm;codecs=vp9,opus"
+      : "video/webm";
+
+    mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+    mediaRecorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "JEE_War_Room_Explainer_Video.webm";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      if (banner) banner.style.display = "none";
+      isRecording = false;
+    };
+
+    mediaRecorder.start();
+    // Start tour from scene 0 with audio
+    loadScene(0, true);
+  }
+
+  function cancelRecording() {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
+    }
+    cancelAnimationFrame(animFrameId);
+    isRecording = false;
+    const banner = document.getElementById("export-banner");
+    if (banner) banner.style.display = "none";
+  }
+
+  function stopRecordingAndDownload() {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
+    }
+    cancelAnimationFrame(animFrameId);
+  }
+
+  window.addEventListener("DOMContentLoaded", init);
+
+  return {
+    togglePlay,
+    next,
+    prev,
+    goTo,
+    replay,
+    seek,
+    toggleMute,
+    toggleSubtitles,
+    toggleFullscreen,
+    downloadAudio,
+    recordAndDownload,
+    cancelRecording
+  };
+})();
+</script>
+
+</body>
+</html>
