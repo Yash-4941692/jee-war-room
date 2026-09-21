@@ -1283,8 +1283,8 @@ function renderFocusRunning(){
       </div>
       ${t.recovered?'<div class="muted">Recovered session — pause time before refresh is counted as running.</div>':''}
     </div></div>`;
-stopTick();
-   if(done){
+  stopTick();
+  if(done){
     if(!t.beeped && !t.recovered){
       t.beeped = true;
       beep();
@@ -1307,6 +1307,7 @@ stopTick();
       renderFocusRunning();
     }
   },250);
+}
 function stopTick(){ if(state.tmrTick){ clearInterval(state.tmrTick); state.tmrTick=null; } }
 function fPause(){ const t=state.tmr; t.pauseAt=Date.now()/1000; renderFocusRunning(); }
 function fResume(){ const t=state.tmr; t.paused+=(Date.now()/1000-t.pauseAt); t.pauseAt=null; renderFocusRunning(); }
