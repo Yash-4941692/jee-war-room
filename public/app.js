@@ -1283,17 +1283,30 @@ function renderFocusRunning(){
       </div>
       ${t.recovered?'<div class="muted">Recovered session — pause time before refresh is counted as running.</div>':''}
     </div></div>`;
-  if(done){ beep(); stopTick(); showComplete(); return; }
-  stopTick();
+stopTick();
+   if(done){
+    if(!t.beeped && !t.recovered){
+      t.beeped = true;
+      beep();
+    }
+    return;
+  }
   state.tmrTick=setInterval(()=>{
+    if(state.view!=="focus") return;
     const el=elapsedRun(), r2=Math.max(0,t.goal-el);
     const timeEl=document.querySelector(".td-time");
     if(timeEl) timeEl.textContent=mmss(r2);
     const p=document.querySelector("#dial-prog");
     if(p){ const size=300,r=130,c=2*Math.PI*r; p.setAttribute("stroke-dashoffset",c*(1-Math.min(1,el/t.goal))); }
-    if(r2<=0){ stopTick(); beep(); showComplete(); }
+    if(r2<=0){
+      stopTick();
+      if(!t.beeped){
+        t.beeped = true;
+        beep();
+      }
+      renderFocusRunning();
+    }
   },250);
-}
 function stopTick(){ if(state.tmrTick){ clearInterval(state.tmrTick); state.tmrTick=null; } }
 function fPause(){ const t=state.tmr; t.pauseAt=Date.now()/1000; renderFocusRunning(); }
 function fResume(){ const t=state.tmr; t.paused+=(Date.now()/1000-t.pauseAt); t.pauseAt=null; renderFocusRunning(); }
