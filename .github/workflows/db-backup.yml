@@ -1,8 +1,23 @@
 name: db-backup
 
-# Weekly safety dump of the Turso database committed to this PRIVATE repo.
-# Requires repository secrets TURSO_DATABASE_URL and TURSO_AUTH_TOKEN
-# (the same values given to Koyeb).
+# Weekly safety dump of the Turso database.
+#
+# IMPORTANT CHANGE: dumps are NO LONGER committed to this repository.
+# The previous version committed backups/warroom-dump.sql every Monday, which
+# put every user's password hash, salt, friend code AND their live plaintext
+# session tokens into git history — i.e. a working login for any account, for
+# anyone who could read the repo. See SECURITY.md.
+#
+# Both dumps are now uploaded as PRIVATE, EXPIRING workflow artifacts instead:
+#   * warroom-dump-redacted  (90 days) — safe shape, no credentials at all
+#   * warroom-dump-full      (30 days) — complete/restorable, still private to
+#                                        this repo; never touches git history
+#
+# Artifacts are only downloadable by people with access to this repository.
+# For a permanent off-GitHub copy, run tools/turso_io.py dump --full against an
+# encrypted volume (see SECURITY.md → Backups).
+#
+# Requires repository secrets TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.
 on:
   schedule:
     - cron: "37 3 * * 1"   # Mondays 03:37 UTC
@@ -12,7 +27,7 @@ jobs:
   dump:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read        # no longer needs write: nothing is committed
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,17 +35,52 @@ jobs:
           python-version: "3.12"
       - name: Install client
         run: pip install libsql==0.1.11
-      - name: Dump database to SQL
+
+      - name: Dump database (redacted)
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          mkdir -p backups
-          python tools/turso_io.py dump backups/warroom-dump.sql
-      - name: Commit dump
+          mkdir -p /tmp/dumps
+          python tools/turso_io.py dump /tmp/dumps/warroom-dump.sql
+
+      - name: Dump database (full, for restores)
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
-          git config user.name "db-backup-bot"
-          git config user.email "db-backup-bot@users.noreply.github.com"
-          git add backups/
-          git commit -m "chore: weekly database dump [skip deploy]" || echo "no changes"
-          git push
+          # writes outside the worktree on purpose; the tool refuses to write a
+          # full dump inside the repo unless ALLOW_FULL_DUMP_IN_REPO=1
+          python tools/turso_io.py dump --full /tmp/dumps/warroom-dump-FULL.sql
+
+      - name: Verify no secrets in the redacted dump
+        run: |
+          if grep -Eq "[0-9a-f]{64}" /tmp/dumps/warroom-dump.sql; then
+            echo "::error::redacted dump still contains 64-hex digests"
+            exit 1
+          fi
+          if grep -q 'INTO "sessions"' /tmp/dumps/warroom-dump.sql; then
+            echo "::error::redacted dump still contains session rows"
+            exit 1
+          fi
+          echo "redacted dump is clean"
+
+      - name: Upload redacted dump (private artifact, 90 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: warroom-dump-redacted
+          path: /tmp/dumps/warroom-dump.sql
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload full dump (private artifact, 30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: warroom-dump-full
+          path: /tmp/dumps/warroom-dump-FULL.sql
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Destroy the full dump from the runner
+        if: always()
+        run: shred -u /tmp/dumps/warroom-dump-FULL.sql 2>/dev/null || rm -f /tmp/dumps/warroom-dump-FULL.sql

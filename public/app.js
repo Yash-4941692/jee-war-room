@@ -227,19 +227,22 @@ function forgotPasswordModal(){
   const curName = ($("#auth-name")?.value || "").trim();
   modal(`${mHead("🔑 Reset Password")}
     <div style="font-size:13px;line-height:1.5;margin-bottom:12px">
-      Forgot your password? Enter your username and your 6-letter friend code to set a new password.
+      Enter your username and one of your <b>recovery codes</b> to set a new password.
+      Each code works <b>once</b>. You were shown 8 of them when you signed up.
     </div>
     <div class="m-step-lab">YOUR USERNAME</div>
-    <input id="rp-name" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="e.g. Yash" value="${esc(curName)}">
-    <div class="m-step-lab">YOUR 6-LETTER FRIEND CODE</div>
-    <input id="rp-code" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px;text-transform:uppercase" placeholder="e.g. ALYWAY" maxlength="10">
-    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
-    <input id="rp-pass" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="New password">
+    <input id="rp-name" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="e.g. Arjun" value="${esc(curName)}" autocomplete="username">
+    <div class="m-step-lab">RECOVERY CODE (e.g. K7QM-4TZP-9BXD)</div>
+    <input id="rp-code" type="text" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px;text-transform:uppercase;letter-spacing:1px" placeholder="XXXX-XXXX-XXXX" maxlength="20" autocomplete="one-time-code" spellcheck="false">
+    <div class="m-step-lab">NEW PASSWORD (minimum 8 characters)</div>
+    <input id="rp-pass" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="New password" autocomplete="new-password">
     <div class="m-step-lab">CONFIRM NEW PASSWORD</div>
-    <input id="rp-conf" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="Re-enter new password">
+    <input id="rp-conf" type="password" class="addinput" style="width:100%;margin:6px 0 10px;padding:10px" placeholder="Re-enter new password" autocomplete="new-password">
     <div id="rp-err" class="auth-err" style="margin-bottom:8px"></div>
     <div class="muted sm" style="margin-bottom:14px;line-height:1.4">
-      💡 Don't remember your 6-letter code? Ask Yash (Admin) to reset your password from Settings → Registered Users.
+      🔒 Your <b>friend code</b> can no longer reset a password — it is meant to be shared
+      with buddies, so it is not a secret. Lost all your recovery codes? Message the admin,
+      who can reset it from Settings → Registered Users. Resetting signs you out everywhere.
     </div>
     <div class="flex" style="gap:8px">
       <button class="btn full" onclick="App.closeModal()">CANCEL</button>
@@ -254,28 +257,130 @@ function forgotPasswordModal(){
 async function submitResetPassword(){
   const name = ($("#rp-name")?.value || "").trim();
   const code = ($("#rp-code")?.value || "").trim().toUpperCase();
+  // Trimmed like the server does, so a stray space can never cause a rejection.
   const pass = ($("#rp-pass")?.value || "").trim();
   const conf = ($("#rp-conf")?.value || "").trim();
   const err = $("#rp-err");
   if(!name){ if(err) err.textContent="Please enter your username."; return; }
-  if(!code){ if(err) err.textContent="Please enter your 6-letter friend code."; return; }
-  if(pass.length < 4){ if(err) err.textContent="Password must be at least 4 characters."; return; }
+  if(!code){ if(err) err.textContent="Please enter one of your recovery codes."; return; }
+  if(code.replace(/[^A-Z0-9]/g,"").length < 8){
+    if(err) err.textContent="That looks like a friend code, not a recovery code (XXXX-XXXX-XXXX).";
+    return;
+  }
+  if(pass.length < 8){ if(err) err.textContent="Password must be at least 8 characters."; return; }
   if(pass !== conf){ if(err) err.textContent="Passwords do not match."; return; }
   const btn = $("#rp-submit-btn");
   if(btn){ btn.disabled = true; btn.textContent = "RESETTING…"; }
   try{
     await warmUpServer();
-    const r = await api("/api/auth/reset-password", { name, code, newPassword: pass });
+    const r = await api("/api/auth/reset-password", { name, recoveryCode: code, newPassword: pass });
     if(r.token) setToken(r.token);
     closeModal();
     toast("Password reset! Logging in…", "good");
     await reloadMe(true);
     enterApp();
+    if(typeof r.recoveryRemaining === "number" && r.recoveryRemaining <= 2){
+      setTimeout(()=>toast(`Only ${r.recoveryRemaining} recovery code(s) left — generate more in Settings`,""),600);
+    }
   }catch(e){
     if(btn){ btn.disabled = false; btn.textContent = "RESET PASSWORD"; }
     if(err) err.textContent = e.message;
     toast(e.message, "bad");
   }
+}
+
+/* ---------------- one-time recovery codes ----------------
+   The server returns these exactly once (it stores only SHA-256 digests), so
+   this screen is the user's only chance to save them. */
+function showRecoveryCodes(codes, opts){
+  opts = opts || {};
+  if(!codes || !codes.length) return;
+  state.pendingCodes = codes.slice();
+  const why = opts.reason === "login"
+    ? "Your account predates recovery codes, so here is your first set."
+    : "Save these somewhere safe — they are the only way back in if you forget your password.";
+  modal(`${mHead("🔐 Your Recovery Codes")}
+    <div style="font-size:13px;line-height:1.5;margin-bottom:12px">
+      ${why} Each code resets your password <b>once</b>.
+      <span class="danger-note">They are shown only this one time — nobody, not even the admin, can read them later.</span>
+    </div>
+    <div id="rc-grid" class="rc-grid">${codes.map(c=>`<code class="rc-code">${esc(c)}</code>`).join("")}</div>
+    <div class="flex" style="gap:8px;margin:12px 0">
+      <button class="btn full" onclick="App.copyRecoveryCodes()">📋 COPY ALL</button>
+      <button class="btn full" onclick="App.downloadRecoveryCodes()">⬇️ DOWNLOAD</button>
+    </div>
+    <label class="rc-confirm"><input type="checkbox" id="rc-saved" onchange="App.rcToggleSaved()">
+      I have saved these codes outside this browser.</label>
+    <button class="btn-primary full" id="rc-done" disabled onclick="App.closeModal()" style="margin-top:12px;opacity:.5">DONE</button>`);
+}
+function rcToggleSaved(){
+  const ok = !!document.getElementById("rc-saved")?.checked;
+  const b = document.getElementById("rc-done");
+  if(b){ b.disabled = !ok; b.style.opacity = ok ? "1" : ".5"; }
+}
+function copyRecoveryCodes(){
+  const codes = state.pendingCodes || [];
+  const txt = "JEE WAR ROOM — my password recovery codes\nEach code works ONCE. Generated "
+    + new Date().toLocaleString() + "\n\n" + codes.join("\n") + "\n";
+  if(navigator.clipboard?.writeText){
+    navigator.clipboard.writeText(txt).then(()=>toast("Recovery codes copied","good"),
+                                            ()=>toast("Copy failed — use DOWNLOAD","bad"));
+  } else toast("Copy is unavailable here — use DOWNLOAD","bad");
+}
+function downloadRecoveryCodes(){
+  const codes = state.pendingCodes || [];
+  const txt = "JEE WAR ROOM — my password recovery codes\nEach code works ONCE. Generated "
+    + new Date().toLocaleString() + "\n\n" + codes.join("\n") + "\n";
+  try{
+    const blob = new Blob([txt], {type:"text/plain"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "jee-war-room-recovery-codes.txt";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+    toast("Downloaded — keep the file safe","good");
+  }catch(e){ toast("Download failed","bad"); }
+}
+
+/* ---------------- account security panel ---------------- */
+async function loadSecurity(){
+  const box = document.querySelector("#sec-box"); if(!box) return;
+  try{
+    const d = await api("/api/me/security");
+    state.security = d;
+    const rc = d.recovery || {};
+    const left = rc.remaining || 0;
+    const warn = left === 0 ? "danger-note" : (left <= 2 ? "warn-note" : "muted");
+    box.innerHTML = `
+      <div class="set-row"><div class="grow">
+        <div class="muted">Recovery codes left</div>
+        <b class="${warn}">${left} of ${rc.total||8}</b>
+        <div class="muted sm">${rc.generatedAt ? "generated "+esc(fmtTime(rc.generatedAt)) : "never generated"}${rc.lastUsedAt ? " · last used "+esc(fmtTime(rc.lastUsedAt)) : ""}</div>
+      </div><button class="btn small" onclick="App.newRecoveryCodes()">GENERATE NEW</button></div>
+      <div class="set-row"><div class="grow">
+        <div class="muted">Signed-in devices</div>
+        <b>${(d.sessions||[]).length} active session${(d.sessions||[]).length===1?"":"s"}</b>
+        <div class="muted sm">Changing your password signs out every other device automatically.</div>
+      </div><button class="btn small danger" onclick="App.revokeAllSessions()">LOG OUT EVERYWHERE</button></div>`;
+  }catch(e){
+    box.innerHTML = `<div class="muted sm">Couldn't load security info: ${esc(e.message)}</div>`;
+  }
+}
+async function newRecoveryCodes(){
+  if(!confirm("Generate a NEW set of recovery codes? Any codes you saved before will stop working.")) return;
+  try{
+    const r = await api("/api/me/recovery-codes", {});
+    showRecoveryCodes(r.recoveryCodes, {});
+    loadSecurity();
+  }catch(e){ toast(e.message,"bad"); }
+}
+async function revokeAllSessions(){
+  if(!confirm("Log out of every device except this one? Do this if you think someone else has used your account.")) return;
+  try{
+    await api("/api/me/sessions/revoke-all", {});
+    toast("All other devices signed out","good");
+    loadSecurity();
+  }catch(e){ toast(e.message,"bad"); }
 }
 async function authSubmit(ev){
   ev.preventDefault();
@@ -292,11 +397,16 @@ async function authSubmit(ev){
       state.myCode=r.code;
       $("#auth-form").classList.add("hidden"); $("#auth-after").classList.remove("hidden");
       $("#after-code").textContent=r.code;
+      // Recovery codes are returned exactly once — show them before anything else.
+      showRecoveryCodes(r.recoveryCodes, {reason:"signup"});
       return;
     }else{
       const r = await api("/api/auth/login",{name,password:pw});
       if(r.token) setToken(r.token);
       await reloadMe(true); enterApp();
+      // Accounts created before recovery codes existed get their first set on
+      // the first successful sign-in after the upgrade (server sends it once).
+      if(r.recoveryCodes) showRecoveryCodes(r.recoveryCodes, {reason:"login"});
     }
   }catch(e){ $("#auth-err").textContent=e.message; }
   finally{ btn.disabled=false; }
@@ -893,12 +1003,15 @@ function adminResetPw(id){
   const name=u ? u.name : (id===state.me?.user?.id ? state.me.user.name : "User");
   modal(`${mHead("🔐 Set New Password")}
     <div style="margin-bottom:12px;font-size:14px">Set a new password for <b>${esc(name)}</b>:</div>
-    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
+    <div class="m-step-lab">NEW PASSWORD (minimum 8 characters)</div>
     <div style="margin:8px 0 12px">
       <input id="adm-new-pw" type="text" class="addinput" style="width:100%;font-size:16px;padding:10px" placeholder="Enter new password" autocomplete="off" autocorrect="off" autocapitalize="off">
     </div>
     <div class="muted sm" style="margin-bottom:14px;line-height:1.4">
-      Passwords are stored one-way encrypted — nobody can view current passwords. Share this new password with <b>${esc(name)}</b>.
+      Passwords are stored one-way encrypted — nobody can view current passwords.
+      Share this new password with <b>${esc(name)}</b> over a private channel.
+      ${id===state.me?.user?.id ? "This is your own account, so this device stays signed in."
+        : "This signs <b>"+esc(name)+"</b> out of every device immediately."}
     </div>
     <div id="adm-pw-err" class="auth-err" style="margin-bottom:8px"></div>
     <div class="flex" style="gap:8px">
@@ -912,9 +1025,9 @@ async function saveAdminPw(id){
   const inp=document.getElementById("adm-new-pw");
   const err=document.getElementById("adm-pw-err");
   const pw=(inp?.value||"").trim();
-  if(pw.length<4){
-    if(err) err.textContent="Password must be at least 4 characters.";
-    toast("Password must be at least 4 characters","bad");
+  if(pw.length<8){
+    if(err) err.textContent="Password must be at least 8 characters.";
+    toast("Password must be at least 8 characters","bad");
     return;
   }
   const btn=document.getElementById("adm-save-pw-btn");
@@ -922,9 +1035,12 @@ async function saveAdminPw(id){
   try{
     const u=(state.adminUsers||[]).find(x=>x.id===id);
     const name=u ? u.name : (id===state.me?.user?.id ? state.me.user.name : "User");
-    await api("/api/admin/set-password",{userId:id,password:pw});
+    const r=await api("/api/admin/set-password",{userId:id,password:pw});
     closeModal();
     toast("New password set for "+name,"good");
+    if(r && r.revokedSessions){
+      setTimeout(()=>toast(name+" was signed out of all devices — they'll need the new password",""),700);
+    }
   }catch(e){
     if(btn){ btn.disabled=false; btn.textContent="SET PASSWORD"; }
     if(err) err.textContent=e.message;
@@ -1919,9 +2035,19 @@ async function renderSettings(){
         `<button class="color-dot ${u.avatar_color===c?'sel':''}" style="background:${c}" onclick="App.setColor('${c}')"></button>`).join("")}</div></div></div>
     <div class="set-row"><div class="grow"><div class="muted">JEE Main exam date</div><b>${u.exam_date?fmtDate(u.exam_date):'not set'}</b></div>
       <button class="btn small" onclick="App.editExam()">EDIT</button></div>
-    <div class="set-row"><div class="grow"><div class="muted">Password</div><b>••••••••</b></div>
+    <div class="set-row"><div class="grow"><div class="muted">Password</div><b>••••••••</b>
+      <div class="muted sm">Stored as a one-way PBKDF2 hash — nobody can read it, not even the admin.</div></div>
       <button class="btn small" onclick="App.changePasswordModal()">CHANGE</button></div>
     <div class="set-row"><div class="grow"><button class="btn danger btn" onclick="App.logout()">LOGOUT</button></div></div></div>`;
+
+  // account security: recovery codes + sessions (fills in after paint)
+  h+=`<div class="card set-card"><h3>🔐 ACCOUNT SECURITY</h3>
+    <div id="sec-box"><div class="muted sm">Loading…</div></div>
+    <div class="muted sm" style="margin-top:10px;line-height:1.5">
+      Your <b>friend code</b> <b>${esc(u.code)}</b> only connects you with buddies.
+      It is <b>not</b> a password and can no longer be used to reset one — share it freely.
+      Your <b>recovery codes</b> are the secret ones; keep those private.
+    </div></div>`;
 
   // admin only: announcements + user management (user list fills in AFTER
   // the screen paints so Settings opens instantly)
@@ -2066,6 +2192,7 @@ async function renderSettings(){
   h+=`<div class="about-credit"><div class="about-mark">🎯 JEE WAR ROOM</div><div>Designed &amp; built by <b>Yash Sharma</b></div><div class="muted" style="font-size:11px">Two aspirants. One mission. No excuses.</div></div>`;
 
   $("#view").innerHTML=h;
+  loadSecurity();
   if(isAdmin()){ loadAdminUsers(); loadAdminReports(); }
   api("/api/air").then(a=>{
     const cc=a.components, dt=a.detail;
@@ -2083,7 +2210,7 @@ function changePasswordModal(){
       <div class="m-step-lab">CURRENT PASSWORD</div>
       <input id="pw-cur" type="password" class="addinput" style="width:100%;margin:6px 0 12px;padding:10px" placeholder="Current password">
     ` : ''}
-    <div class="m-step-lab">NEW PASSWORD (minimum 4 characters)</div>
+    <div class="m-step-lab">NEW PASSWORD (minimum 8 characters)</div>
     <input id="pw-new" type="password" class="addinput" style="width:100%;margin:6px 0 12px;padding:10px" placeholder="New password">
     <div class="m-step-lab">CONFIRM NEW PASSWORD</div>
     <input id="pw-conf" type="password" class="addinput" style="width:100%;margin:6px 0 14px;padding:10px" placeholder="Re-enter new password">
@@ -2107,9 +2234,9 @@ async function saveMyPassword(){
     toast("Please enter your current password","bad");
     return;
   }
-  if(nw.length<4){
-    if(err) err.textContent="New password must be at least 4 characters.";
-    toast("New password must be at least 4 characters","bad");
+  if(nw.length<8){
+    if(err) err.textContent="New password must be at least 8 characters.";
+    toast("New password must be at least 8 characters","bad");
     return;
   }
   if(nw!==conf){
@@ -2271,6 +2398,8 @@ return {
   addTemplate, editTemplate, saveTemplate, removeTemplate, saveXP, saveWeights, exportData, wipeData,
   dismissAnnouncement, postAnnouncement, deleteAnnouncement, adminResetPw, saveAdminPw,
   changePasswordModal, saveMyPassword, forgotPasswordModal, submitResetPassword,
+  showRecoveryCodes, rcToggleSaved, copyRecoveryCodes, downloadRecoveryCodes,
+  loadSecurity, newRecoveryCodes, revokeAllSessions,
   sendReport, resolveReport,
   beginTimer,
 };

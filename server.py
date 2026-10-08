@@ -3,9 +3,22 @@
 JEE WAR ROOM — zero-dependency backend.
 Python stdlib HTTP server + SQLite (real persistent server-side database).
 Auth: PBKDF2 password hashing + opaque server-side session cookies.
+
+SECURITY MODEL (see SECURITY.md for the full write-up)
+  * passwords are one-way PBKDF2 hashes and can never be read back;
+  * session tokens are stored only as SHA-256 digests, so a leaked database
+    or backup dump is not a set of live logins;
+  * self-service password reset uses ONE-TIME RECOVERY CODES. The friend code
+    is a sharing secret (users hand it to up to 10 buddies) and is therefore
+    never accepted as proof of identity;
+  * login / signup / reset are throttled per username and per IP;
+  * error messages do not reveal whether a username exists;
+  * changing a password revokes every other session for that account.
 """
-import http.server, socketserver, json, sqlite3, os, re, time, math, random, string
+import http.server, socketserver, json, sqlite3, os, re, sys, time, math, random, string, secrets
 import hashlib, hmac as hmac_mod
+import traceback
+import authsec
 from datetime import date, datetime, timedelta
 try:
     from datetime import timezone
@@ -42,9 +55,24 @@ _SCHEMA_SQL = r"""
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
       pass_hash TEXT NOT NULL, salt TEXT NOT NULL, code TEXT UNIQUE NOT NULL,
-      partner_id INTEGER, exam_date TEXT, avatar_color TEXT, created_at TEXT);
+      partner_id INTEGER, exam_date TEXT, avatar_color TEXT, created_at TEXT,
+      pw_changed_at TEXT);
     CREATE TABLE IF NOT EXISTS sessions(
-      token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT);
+      -- `token` holds SHA-256(bearer token), never the token itself
+      token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT,
+      expires_at REAL NOT NULL DEFAULT 0, user_agent TEXT);
+    CREATE TABLE IF NOT EXISTS recovery_codes(
+      -- one-time password-reset codes; only SHA-256(code) is stored
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+      code_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL,
+      used_at TEXT, used_ip TEXT);
+    CREATE TABLE IF NOT EXISTS auth_throttle(
+      key TEXT PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0,
+      window_start REAL NOT NULL DEFAULT 0, locked_until REAL NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS auth_events(
+      id INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
+      user_id INTEGER, name TEXT, ip TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS settings(user_id INTEGER PRIMARY KEY, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS chapters(
       id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, subject TEXT NOT NULL,
@@ -93,14 +121,67 @@ _SCHEMA_SQL = r"""
     CREATE INDEX IF NOT EXISTS ix_t_day ON targets(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_mock_day ON mocks(user_id, day);
     CREATE INDEX IF NOT EXISTS ix_err_day ON errors(user_id, day);
+    CREATE INDEX IF NOT EXISTS ix_rc_user ON recovery_codes(user_id, used_at);
+    CREATE INDEX IF NOT EXISTS ix_sess_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS ix_ae_ts ON auth_events(ts);
     """
+
+# DDL for the tables added by the auth-hardening pass. Kept apart from
+# _SCHEMA_SQL so an already-warm cloud database only pays for what is missing.
+_AUTH_DDL = r"""
+    CREATE TABLE IF NOT EXISTS recovery_codes(
+      id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL,
+      code_hash TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL,
+      used_at TEXT, used_ip TEXT);
+    CREATE TABLE IF NOT EXISTS auth_throttle(
+      key TEXT PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0,
+      window_start REAL NOT NULL DEFAULT 0, locked_until REAL NOT NULL DEFAULT 0,
+      updated_at REAL NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS auth_events(
+      id INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
+      user_id INTEGER, name TEXT, ip TEXT, detail TEXT);
+    CREATE INDEX IF NOT EXISTS ix_rc_user ON recovery_codes(user_id, used_at);
+    CREATE INDEX IF NOT EXISTS ix_sess_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS ix_ae_ts ON auth_events(ts);
+    """
+
+
+def _table_cols(c, table):
+    """Column names of a table, in both local sqlite and cloud libSQL modes."""
+    if not re.fullmatch(r"[A-Za-z_]+", table or ""): return set()
+    try:
+        return {r[1] for r in c.execute("PRAGMA table_info(%s)" % table).fetchall()}
+    except Exception:
+        return set()
+
+
+def _auth_migrate(c):
+    """Idempotent upgrade of an existing database to the hardened auth schema."""
+    c.executescript(_AUTH_DDL)
+    if "pw_changed_at" not in _table_cols(c, "users"):
+        c.execute("ALTER TABLE users ADD COLUMN pw_changed_at TEXT")
+    scols = _table_cols(c, "sessions")
+    if "expires_at" not in scols:
+        c.execute("ALTER TABLE sessions ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
+        # ONE-TIME, deliberate: every token issued before this migration was
+        # stored in PLAINTEXT, and those plaintext tokens were committed to
+        # this repository inside backups/warroom-dump.sql — i.e. they are live
+        # logins for anyone who can read the repo. They are destroyed instead
+        # of migrated, so each user signs in once more; from here on only
+        # SHA-256 digests are ever stored.
+        c.execute("DELETE FROM sessions")
+    if "user_agent" not in scols:
+        c.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT")
+    c.commit()
+
 
 def init_db():
     c = db()
     if dbwrap.CLOUD:
-        # Fast path: if reports table exists, schema is already complete
+        # Fast path: recovery_codes is the newest object, so its presence
+        # means this database has already been fully migrated.
         try:
-            c.execute("SELECT 1 FROM reports LIMIT 1").fetchone()
+            c.execute("SELECT 1 FROM recovery_codes LIMIT 1").fetchone()
             c.close()
             return
         except Exception:
@@ -117,8 +198,7 @@ def init_db():
             "SELECT name FROM pragma_table_info('messages')").fetchall()}
         if "hidden" not in msg_cols:
             c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
-        user_cols = {r[0] for r in c.execute(
-            "SELECT name FROM pragma_table_info('users')").fetchall()}
+        user_cols = _table_cols(c, "users")
         if "role" not in user_cols:
             c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
             c.execute("UPDATE users SET role='admin' WHERE id=(SELECT MIN(id) FROM users)")
@@ -128,6 +208,7 @@ def init_db():
             c.execute("ALTER TABLE chapters ADD COLUMN lectures_total INTEGER NOT NULL DEFAULT 0")
         if "lectures_done" not in ch_cols:
             c.execute("ALTER TABLE chapters ADD COLUMN lectures_done INTEGER NOT NULL DEFAULT 0")
+        _auth_migrate(c)
         c.commit(); c.close()
         return
     c.executescript(_SCHEMA_SQL)
@@ -144,6 +225,7 @@ def init_db():
     if "hidden" not in cols("messages"):
         # comma-separated user ids who cleared this message from their own chat view
         c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
+    _auth_migrate(c)
     c.commit(); c.close()
 
 def seed_chapters(c, uid):
@@ -237,14 +319,129 @@ def save_settings(c, uid, s):
     c.execute("INSERT INTO settings(user_id,json) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET json=excluded.json",
               (uid, json.dumps(s)))
 
-def hash_pw(pw, salt):
-    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 120_000).hex()
+# Password hashing + normalization live in authsec so every flow (signup,
+# login, self-reset, admin-reset, change-password) uses the IDENTICAL rule.
+# Previously three flows trimmed surrounding whitespace and two did not, which
+# is how an account could end up with a password its own owner cannot type.
+hash_pw = authsec.hash_pw
+normalize_pw = authsec.normalize_pw
+new_salt = authsec.new_salt
+
+# Fixed dummy credential used to equalize response time when a username does
+# not exist, so an attacker cannot enumerate accounts by measuring latency.
+_DUMMY_SALT = "0" * 32
+_DUMMY_HASH = authsec.hash_pw("timing-equalizer-not-a-password", _DUMMY_SALT)
+
 
 def gen_code(n=6):
+    """Friend codes — for buddy connections ONLY, never a login credential.
+
+    Uses a CSPRNG (it used to be `random.choices`, whose Mersenne Twister state
+    is recoverable from a handful of outputs) and an unambiguous alphabet.
+    """
     while True:
-        code = "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
-        code = code.replace("0", "X").replace("O", "Y")
-        yield code
+        yield authsec.gen_friend_code(n)
+
+
+# ---------------------------------------------------------------- sessions
+def _make_session_row(c, uid, user_agent=None):
+    """Create a session; returns the PLAINTEXT token for the client.
+
+    Only SHA-256(token) is stored, so a database leak or backup dump is not a
+    pile of working logins. Sessions also carry an absolute expiry.
+    """
+    token = authsec.new_token()
+    c.execute("""INSERT INTO sessions(token,user_id,created_at,expires_at,user_agent)
+                 VALUES(?,?,?,?,?)""",
+              (authsec.hash_token(token), uid, now_iso(),
+               time.time() + authsec.SESSION_TTL_SECONDS,
+               (str(user_agent)[:200] if user_agent else None)))
+    c.commit()
+    return token
+
+
+def revoke_sessions(c, uid, keep_token=None, commit=True):
+    """Kill every session for a user (optionally sparing the current one).
+
+    Called on password reset, password change and admin password set: an
+    attacker who obtained a session before the change does not keep it after.
+    """
+    keep = authsec.hash_token(keep_token) if keep_token else None
+    if keep:
+        c.execute("DELETE FROM sessions WHERE user_id=? AND token!=?", (uid, keep))
+    else:
+        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    if commit: c.commit()
+
+
+def purge_expired_sessions(c):
+    """Cheap opportunistic cleanup of dead sessions."""
+    try:
+        c.execute("DELETE FROM sessions WHERE expires_at>0 AND expires_at<?", (time.time(),))
+        c.commit()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- recovery codes
+def issue_recovery_codes(c, uid, ip=None, commit=True):
+    """Generate a fresh set of recovery codes; returns the PLAINTEXT list.
+
+    Old unused codes are discarded so a lost printout can never be replayed
+    later. This is the ONLY moment the plaintext exists — the database keeps
+    SHA-256 digests, so nobody (not even the admin) can read them back.
+    """
+    codes = authsec.gen_recovery_codes()
+    now = now_iso()
+    c.execute("DELETE FROM recovery_codes WHERE user_id=? AND used_at IS NULL", (uid,))
+    for code in codes:
+        c.execute("""INSERT OR IGNORE INTO recovery_codes(user_id,code_hash,created_at)
+                     VALUES(?,?,?)""", (uid, authsec.hash_code(code), now))
+    if commit: c.commit()
+    authsec.log_event(c, "recovery_codes_issued", user_id=uid, ip=ip,
+                      detail="%d codes" % len(codes), commit=False)
+    return codes
+
+
+def consume_recovery_code(c, uid, code, ip=None):
+    """Use one unused recovery code. Returns True when it was valid."""
+    digest = authsec.hash_code(code)
+    row = c.execute("""SELECT id FROM recovery_codes
+                       WHERE user_id=? AND code_hash=? AND used_at IS NULL""",
+                    (uid, digest)).fetchone()
+    if not row: return False
+    c.execute("UPDATE recovery_codes SET used_at=?, used_ip=? WHERE id=?",
+              (now_iso(), (str(ip)[:64] if ip else None), row["id"]))
+    c.commit()
+    return True
+
+
+def recovery_status(c, uid):
+    """What the user is allowed to know about their own codes (never the codes).
+
+    `total` is the size of the CURRENT batch, not of all history — used codes
+    from superseded batches would otherwise make the counter look wrong.
+    """
+    r = c.execute("""SELECT
+            (SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?) generated_at,
+            (SELECT MAX(used_at) FROM recovery_codes WHERE user_id=?) last_used_at,
+            (SELECT COUNT(*) FROM recovery_codes WHERE user_id=? AND used_at IS NULL) remaining,
+            (SELECT COUNT(*) FROM recovery_codes WHERE user_id=?
+              AND created_at=(SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?)) total
+        """, (uid, uid, uid, uid, uid)).fetchone()
+    if not r: return {"total": 0, "remaining": 0, "generatedAt": None, "lastUsedAt": None}
+    return {"total": int(r["total"] or 0), "remaining": int(r["remaining"] or 0),
+            "generatedAt": r["generated_at"], "lastUsedAt": r["last_used_at"]}
+
+
+def active_sessions(c, uid):
+    rows = c.execute("""SELECT token, created_at, expires_at, user_agent FROM sessions
+                        WHERE user_id=? ORDER BY created_at DESC LIMIT 20""", (uid,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": (r["token"] or "")[:12], "createdAt": r["created_at"],
+                    "expiresAt": r["expires_at"], "userAgent": r["user_agent"]})
+    return out
 
 def ind(n):
     """Indian-style number grouping: 600000 -> 6,00,000"""
@@ -497,16 +694,70 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "JEEWR/1.0"
     def log_message(self, *a): pass
 
+    # ---------------------------------------------------- hardening helpers
+    def _security_headers(self):
+        """Defence-in-depth headers on EVERY response (API and static).
+
+        `frame-ancestors` defaults to 'self'; set FRAME_ANCESTORS to add
+        origins that may embed the app (e.g. a preview/tunnel host).
+        Inline scripts/styles stay allowed because the frontend is a single
+        hand-written file full of onclick= handlers — see SECURITY.md.
+        """
+        fa = os.environ.get("FRAME_ANCESTORS", "").strip() or "'self'"
+        hdrs = [
+            ("Content-Security-Policy",
+             "default-src 'self'; "
+             "script-src 'self' 'unsafe-inline'; "
+             "style-src 'self' 'unsafe-inline'; "
+             "img-src 'self' data: blob:; font-src 'self' data:; "
+             "media-src 'self' data: blob:; "
+             "connect-src 'self'; form-action 'self'; "
+             "object-src 'none'; base-uri 'self'; "
+             "frame-ancestors %s" % fa),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "same-origin"),
+            ("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()"),
+            ("Cross-Origin-Opener-Policy", "same-origin"),
+        ]
+        # X-Frame-Options cannot express wildcards and is ignored by modern
+        # browsers when CSP frame-ancestors is present, so only send it for the
+        # default same-origin case (older browsers) and let CSP cover the rest.
+        if fa == "'self'":
+            hdrs.append(("X-Frame-Options", "SAMEORIGIN"))
+        return hdrs
+
+    def _client_ip(self):
+        """Best-effort client IP (Vercel/Koyeb/tunnel put the real IP in XFF)."""
+        xff = self.headers.get("X-Forwarded-For") or ""
+        if xff:
+            ip = xff.split(",")[0].strip()
+            if ip: return ip[:64]
+        for h in ("X-Real-IP", "CF-Connecting-IP"):
+            v = (self.headers.get(h) or "").strip()
+            if v: return v[:64]
+        try:
+            return (self.client_address[0] or "unknown")[:64]
+        except Exception:
+            return "unknown"
+
     def _send(self, obj, code=200, extra_headers=None):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in self._security_headers(): self.send_header(k, v)
         for k, v in (extra_headers or []): self.send_header(k, v)
         self.end_headers(); self.wfile.write(body)
 
-    def _err(self, msg, code=400): self._send({"error": msg}, code)
+    def _err(self, msg, code=400, extra_headers=None):
+        self._send({"error": msg}, code, extra_headers=extra_headers)
+
+    def _throttled(self, seconds, what="Too many attempts"):
+        """429 with a human message and a Retry-After the client can honour."""
+        s = int(max(1, math.ceil(seconds)))
+        self._err("%s — try again in %s." % (what, authsec.human_wait(s)), 429,
+                  extra_headers=[("Retry-After", str(s))])
 
     def _body(self):
         try:
@@ -524,29 +775,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":")[0]
         return bool(host) and host not in ("localhost", "127.0.0.1", "0.0.0.0")
 
-    def _cookie_header(self, token, max_age=7776000, clear=False):
+    def _cookie_header(self, token, max_age=None, clear=False):
+        if max_age is None: max_age = authsec.SESSION_COOKIE_MAX_AGE
         if clear:
             extra = "SameSite=None; Secure" if self._is_secure() else "SameSite=Lax"
             return f"jwr_sess=; Path=/; Max-Age=0; {extra}"
         extra = "SameSite=None; Secure; HttpOnly" if self._is_secure() else "SameSite=Lax; HttpOnly"
         return f"jwr_sess={token}; Path=/; Max-Age={max_age}; {extra}"
 
-    def _auth(self):
-        token = None
+    def _bearer_token(self):
+        """Token supplied in a header (not the cookie). Custom headers cannot be
+        set by a cross-site request without a CORS preflight, which we never
+        grant — so header auth is inherently CSRF-proof."""
+        ah = self.headers.get("Authorization", "")
+        if ah.lower().startswith("bearer "):
+            t = ah[7:].strip()
+            if t: return t
+        t = (self.headers.get("X-Auth-Token") or "").strip()
+        return t or None
+
+    def _cookie_token(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         ck = cookie.get("jwr_sess")
-        if ck: token = ck.value
-        if not token:
-            ah = self.headers.get("Authorization", "")
-            if ah.lower().startswith("bearer "): token = ah[7:].strip()
-        if not token:
-            token = self.headers.get("X-Auth-Token")
+        return ck.value if ck and ck.value else None
+
+    def _expected_hosts(self):
+        """Hostnames this server is legitimately reachable as.
+
+        A reverse proxy (Vercel, Koyeb, the preview tunnel) may rewrite Host,
+        so the forwarded values and an explicit allow-list are accepted too —
+        otherwise a correct same-origin login would be rejected as cross-site.
+        """
+        hosts = set()
+        for h in (self.headers.get("Host"), self.headers.get("X-Forwarded-Host")):
+            for part in (h or "").split(","):
+                part = part.strip().lower()
+                if part:
+                    hosts.add(part)
+                    hosts.add(part.split(":")[0])          # bare hostname too
+        for extra in (os.environ.get("TRUSTED_ORIGINS") or "").split():
+            extra = extra.strip().lower().rstrip("/")
+            m = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", extra)
+            if m:
+                hosts.add(m.group(1))
+                hosts.add(m.group(1).split(":")[0])
+            elif extra:
+                hosts.add(extra)
+                hosts.add(extra.split(":")[0])
+        return hosts
+
+    def _csrf_ok(self):
+        """Guard state-changing requests that authenticate via COOKIE only.
+
+        Two independent checks, both satisfied by the real frontend:
+          1. the body must be JSON — a cross-site <form> or `text/plain`
+             beacon cannot set Content-Type: application/json without a
+             preflight, and we never send CORS headers;
+          2. Origin (or Referer) must name a host this server is served as.
+        """
+        if self._bearer_token():
+            return True                      # header auth: not forgeable cross-site
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype != "application/json":
+            return False
+        origin = (self.headers.get("Origin") or "").strip()
+        referer = (self.headers.get("Referer") or "").strip()
+        src = origin or referer
+        if not src:
+            # Browsers always attach Origin to a fetch POST. Its absence means a
+            # non-browser client, which has no cookie to abuse — allowed only
+            # when no session cookie is being presented.
+            return not self._cookie_token()
+        m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)", src)
+        if not m:
+            return False
+        return m.group(1).strip().lower() in self._expected_hosts()
+
+    def _auth(self):
+        token = self._cookie_token() or self._bearer_token()
         if not token: return None
-        r = None
         c = db()
         try:
-            r = c.execute("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
-                          (token,)).fetchone()
+            # The DB stores SHA-256(token), so a dump of the sessions table is
+            # useless to an attacker. Sessions also expire, and any session
+            # created before the last password change is rejected outright
+            # (belt-and-braces behind revoke_sessions()).
+            # Only NON-secret user columns are selected: the credential hash
+            # never travels around inside the request-scoped user dict.
+            r = c.execute("""SELECT u.id, u.name, u.code, u.partner_id, u.role,
+                                    u.exam_date, u.avatar_color, u.created_at,
+                                    s.token AS _sess, s.created_at AS _sess_at
+                               FROM sessions s JOIN users u ON u.id=s.user_id
+                              WHERE s.token=?
+                                AND (s.expires_at IS NULL OR s.expires_at=0 OR s.expires_at>?)
+                                AND (u.pw_changed_at IS NULL OR s.created_at>=u.pw_changed_at)""",
+                          (authsec.hash_token(token), time.time())).fetchone()
         finally:
             c.close()
         return dict(r) if r else None
@@ -595,35 +918,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                region=_os.environ.get("VERCEL_REGION", "local"))
                 hc.close()
                 return self._send(out)
-            except Exception as e:
-                return self._err("db unavailable: %s" % e, 503)
+            except Exception:
+                # /healthz is public: never leak driver/host details in the body
+                try:
+                    sys.stderr.write("ERROR /healthz\n%s\n" % traceback.format_exc())
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return self._err("db unavailable", 503)
         if p.startswith("/api/"):
             user = self._auth()
             if not user: return self._err("Not authenticated", 401)
             try: return self.api_get(user, p, q)
-            except Exception as e:
-                return self._err("Server error: %s" % e, 500)
+            except Exception:
+                return self._server_error(p)
         return self.static(p)
+
+    def _server_error(self, p):
+        """Never echo exception text to the client: it leaks schema, paths and
+        library internals to anyone probing the API. Details go to the log."""
+        exc = sys.exc_info()[1]
+        # A browser that navigated away mid-response is not a server fault;
+        # logging it as one hides real failures (and costs log volume).
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        try:
+            sys.stderr.write("ERROR %s %s\n%s\n" % (self.command, p, traceback.format_exc()))
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            return self._err("Server error — please try again.", 500)
+        except Exception:
+            return None        # the socket is already gone; nothing to send
 
     def do_POST(self):
         self._restore_vercel_path()
         u = urlparse(self.path); p = u.path
         if p.startswith("/api/"):
+            # CSRF: cookie-authenticated POSTs must be same-origin JSON.
+            # (Production sets SameSite=None; Secure so the app can be
+            # embedded/proxied, which makes this check the real CSRF defence.)
+            if not self._csrf_ok():
+                return self._err("Cross-site request blocked.", 403)
             body = self._body()
             if body is None: return self._err("Invalid request body")
             auth_free = (p in ("/api/auth/signup", "/api/auth/login", "/api/auth/reset-password"))
             user = self._auth()
             if not user and not auth_free: return self._err("Not authenticated", 401)
             try: return self.api_post(user, p, body)
-            except Exception as e:
-                return self._err("Server error: %s" % e, 500)
+            except Exception:
+                return self._server_error(p)
         self._err("Not found", 404)
 
     # -------- static
     def static(self, p):
         if p == "/": p = "/index.html"
         fn = os.path.normpath(os.path.join(STATIC, p.lstrip("/")))
-        if not fn.startswith(STATIC) or not os.path.isfile(fn):
+        # compare against STATIC + separator: a bare startswith() also accepts
+        # sibling directories like ".../jee-war-room-secrets/x"
+        if not fn.startswith(STATIC + os.sep) or not os.path.isfile(fn):
             fn = os.path.join(STATIC, "index.html")
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
                  "css": "text/css; charset=utf-8", "svg": "image/svg+xml", "png": "image/png",
@@ -633,6 +987,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for k, v in self._security_headers(): self.send_header(k, v)
         if fn.endswith(".html"):
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
@@ -657,6 +1012,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "xp": level_info(xp_total(c, uid)), "streak": streak_info(c, uid, s),
                        "air": self._air(c, uid, s)}
                 return self._send(out)
+            if p == "/api/me/security": return self.security_info(c, uid)
             if p == "/api/targets":
                 day = q.get("date", [TODAY()])[0]
                 if not valid_day(day): return self._err("Invalid date")
@@ -717,6 +1073,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       (SELECT MAX(created_at) FROM sessions se WHERE se.user_id=u.id) last_login
                     FROM users u ORDER BY u.id""", (since,)).fetchall()
                 return self._send({"users": [rowdict(r) for r in rows]})
+            if p == "/api/admin/auth-events":
+                if not self.is_admin(c, uid): return self._err("Admin only.", 403)
+                rows = c.execute("""SELECT id,ts,kind,user_id,name,ip,detail FROM auth_events
+                                    ORDER BY id DESC LIMIT 200""").fetchall()
+                return self._send({"events": [rowdict(r) for r in rows]})
             if p == "/api/stats":
                 return self._send(self._stats(c, uid, s, q.get("range", ["30"])[0]))
             if p == "/api/export":
@@ -950,15 +1311,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.commit()
         try:
             if p == "/api/auth/logout":
-                tok = None
-                cookie = SimpleCookie(self.headers.get("Cookie", "")); t = cookie.get("jwr_sess")
-                if t: tok = t.value
-                ah = self.headers.get("Authorization", "")
-                if not tok and ah.lower().startswith("bearer "): tok = ah[7:].strip()
+                # sessions are keyed by SHA-256(token), so delete via the digest
+                # resolved during auth (works for cookie AND header tokens).
+                tok = user.get("_sess") or None
+                if not tok:
+                    raw = self._cookie_token() or self._bearer_token()
+                    if raw: tok = authsec.hash_token(raw)
                 if tok: c.execute("DELETE FROM sessions WHERE token=?", (tok,)); c.commit()
                 return self._send({"ok": True}, extra_headers=[("Set-Cookie", self._cookie_header("", clear=True))])
             if p == "/api/me": return self.update_me(c, uid, body)
             if p == "/api/me/password": return self.change_my_password(c, uid, body)
+            if p == "/api/me/recovery-codes": return self.regenerate_recovery_codes(c, uid, body)
+            if p == "/api/me/sessions/revoke-all": return self.revoke_all_sessions(c, uid, body)
             if p == "/api/friend/connect": return self.friend_connect(c, user, body)
             if p == "/api/friend/unlink": return self.friend_unlink(c, user, body)
             if p == "/api/messages": return self.send_message(c, user, body)
@@ -1001,23 +1365,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.close()
 
     # -------- auth
+    # One message for every failed credential check, whatever the real reason.
+    # Distinct messages ("no account found" vs "wrong code") let an attacker
+    # enumerate usernames; identical ones do not.
+    LOGIN_FAIL = ("That name and password don't match. Check for a stray space, "
+                  "or reset with a recovery code.")
+    RESET_FAIL = ("That recovery code isn't valid for this account. Codes are "
+                  "single-use — check for typos, use another one, or ask the "
+                  "admin to reset your password.")
+    FRIEND_CODE_RETIRED = ("Friend codes can no longer be used to reset a password "
+                           "(they are meant to be shared with buddies, so they are "
+                           "not a secret). Use one of your 12-character recovery "
+                           "codes, or ask the admin.")
+
     def _make_session(self, c, uid):
-        token = hashlib.sha256(os.urandom(32)).hexdigest()
-        c.execute("INSERT INTO sessions(token,user_id,created_at) VALUES(?,?,?)",
-                  (token, uid, now_iso()))
-        c.commit()
-        return token
+        """Issue a session; only its SHA-256 digest is stored."""
+        return _make_session_row(c, uid, self.headers.get("User-Agent"))
+
+    def _throttle_gate(self, c, keys):
+        """Return a 429 response if any of the given throttle keys is locked."""
+        wait, worst = 0.0, "Too many attempts"
+        for key, _kind, label in keys:
+            w = authsec.throttle_remaining(c, key)
+            if w > wait:
+                wait, worst = w, label
+        if wait > 0:
+            return self._throttled(wait, worst)
+        return None
 
     def signup(self, body):
         name = (body.get("name") or "").strip()
-        pw = body.get("password") or ""
+        pw = body.get("password")
+        ip = self._client_ip()
+        if not isinstance(pw, str): return self._err("Invalid password.")
         if not (2 <= len(name) <= 30): return self._err("Name must be 2–30 characters.")
-        if len(pw) < 4: return self._err("Password must be at least 4 characters.")
+        pol = authsec.password_policy_error(pw, name)
+        if pol: return self._err(pol)
         c = db()
         try:
+            skey = authsec.throttle_key("s", ip)
+            wait = authsec.throttle_remaining(c, skey)
+            if wait: return self._throttled(wait, "Too many sign-ups from your network")
             if c.execute("SELECT 1 FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone():
+                authsec.log_event(c, "signup_name_taken", name=name, ip=ip)
                 return self._err("That name is already taken.")
-            salt = hashlib.sha256(os.urandom(16)).hexdigest()
+            salt = new_salt()
             code_gen = gen_code(); code = next(code_gen)
             while c.execute("SELECT 1 FROM users WHERE code=?", (code,)).fetchone(): code = next(code_gen)
             colors = ["#f97316", "#22d3ee", "#a3e635", "#f472b6", "#facc15", "#818cf8"]
@@ -1027,9 +1419,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 yr = datetime.now(IST).date().year + (1 if datetime.now(IST).date().month >= 6 else 0)
                 exam = f"{yr}-01-21"
             role = "admin" if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0 else "user"
-            cur = c.execute("""INSERT INTO users(name,pass_hash,salt,code,exam_date,avatar_color,created_at,role)
-                VALUES(?,?,?,?,?,?,?,?)""", (name, hash_pw(pw, salt), salt, code, exam,
-                random.choice(colors), now_iso(), role))
+            now = now_iso()
+            cur = c.execute("""INSERT INTO users(name,pass_hash,salt,code,exam_date,avatar_color,created_at,role,pw_changed_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""", (name, hash_pw(pw, salt), salt, code, exam,
+                secrets.choice(colors), now, role, now))
             uid = cur.lastrowid
             s = default_settings(); s["sweepDay"] = TODAY()
             save_settings(c, uid, s)
@@ -1040,46 +1433,173 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
             c.commit()
             token = self._make_session(c, uid)
-            return self._send({"ok": True, "code": code, "token": token},
+            # Recovery codes are shown to the user exactly once, right here.
+            codes = issue_recovery_codes(c, uid, ip)
+            authsec.log_event(c, "signup_ok", user_id=uid, name=name, ip=ip)
+            return self._send({"ok": True, "code": code, "token": token, "recoveryCodes": codes},
                               extra_headers=[("Set-Cookie", self._cookie_header(token))])
         finally:
             c.close()
 
     def login(self, body):
-        name = (body.get("name") or "").strip(); pw = body.get("password") or ""
+        name = (body.get("name") or "").strip()
+        pw = body.get("password")
+        ip = self._client_ip()
+        if not isinstance(pw, str): return self._err("Invalid password.")
+        ukey = authsec.throttle_key("u", name)
+        ikey = authsec.throttle_key("i", ip)
         c = db()
         try:
+            blocked = self._throttle_gate(c, [(ukey, "u", "Too many failed sign-ins"),
+                                              (ikey, "i", "Too many failed sign-ins from your network")])
+            if blocked: return blocked
             u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
-            if not u or not hmac_mod.compare_digest(u["pass_hash"], hash_pw(pw, u["salt"])):
-                return self._err("Wrong name or password.", 401)
+            if u:
+                ok, legacy = authsec.verify_pw(pw, u["pass_hash"], u["salt"])
+            else:
+                # Burn the same PBKDF2 cost as a real check so response timing
+                # cannot be used to discover which usernames exist.
+                authsec.verify_pw(pw, _DUMMY_HASH, _DUMMY_SALT)
+                ok, legacy = False, False
+            if not ok:
+                authsec.throttle_fail(c, ukey, "u", commit=False)
+                wait = authsec.throttle_fail(c, ikey, "i")
+                authsec.log_event(c, "login_fail", user_id=(u["id"] if u else None),
+                                  name=name, ip=ip,
+                                  detail=("no such user" if not u else "bad password"))
+                if wait > 0: return self._throttled(wait, "Too many failed sign-ins")
+                return self._err(self.LOGIN_FAIL, 401)
+            if legacy:
+                # Self-heal: this account's hash was computed on an un-trimmed
+                # password (pre-normalization). Re-hash the trimmed form so the
+                # "correct password rejected" bug cannot come back for them.
+                # pw_changed_at is deliberately NOT touched: the credential did
+                # not change, only its storage form, so the user's other devices
+                # must stay signed in.
+                salt = new_salt()
+                c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?",
+                          (hash_pw(pw, salt), salt, u["id"]))
+                c.commit()
+            authsec.throttle_clear(c, ukey, commit=False)
+            authsec.throttle_clear(c, ikey)
+            self._housekeeping(c)
+            uid = u["id"]
+            token = self._make_session(c, uid)
+            out = {"ok": True, "token": token}
+            # Accounts that predate recovery codes get a set on their first
+            # successful sign-in after this upgrade — the UI shows it once.
+            if recovery_status(c, uid)["total"] == 0:
+                out["recoveryCodes"] = issue_recovery_codes(c, uid, ip)
+            authsec.log_event(c, "login_ok", user_id=uid, name=u["name"], ip=ip)
+            return self._send(out, extra_headers=[("Set-Cookie", self._cookie_header(token))])
+        finally:
+            c.close()
+
+    _LAST_HOUSEKEEPING = [0.0]
+
+    def _housekeeping(self, c):
+        """At most once an hour per worker: drop expired sessions/old counters."""
+        now = time.time()
+        if now - Handler._LAST_HOUSEKEEPING[0] < 3600: return
+        Handler._LAST_HOUSEKEEPING[0] = now
+        purge_expired_sessions(c)
+        authsec.throttle_housekeeping(c)
+        authsec.prune_events(c)
+
+    def reset_password(self, body):
+        """Self-service reset with a ONE-TIME RECOVERY CODE.
+
+        The friend code is deliberately not accepted: the app tells every user
+        to share it with up to 10 buddies, so anyone holding it could otherwise
+        take over the account (that was the previous behaviour).
+        """
+        name = (body.get("name") or "").strip()
+        rcode = body.get("recoveryCode")
+        if not isinstance(rcode, str) or not rcode.strip():
+            rcode = body.get("code")            # older clients send `code`
+        newpw = body.get("newPassword")
+        ip = self._client_ip()
+        if not name: return self._err("Enter your name.")
+        if not isinstance(newpw, str): return self._err("Invalid password.")
+        if not isinstance(rcode, str) or not rcode.strip():
+            return self._err("Enter one of your recovery codes.")
+        # Shape check first: a 6-character friend code is rejected with an
+        # explanation WITHOUT touching the database, so nothing about the
+        # account's existence is revealed.
+        if len(authsec.normalize_code(rcode)) < 8:
+            return self._err(self.FRIEND_CODE_RETIRED)
+        pol = authsec.password_policy_error(newpw, name)
+        if pol: return self._err(pol)
+        ukey = authsec.throttle_key("u", name)
+        ikey = authsec.throttle_key("i", ip)
+        rkey = authsec.throttle_key("r", ip)
+        c = db()
+        try:
+            blocked = self._throttle_gate(c, [(ukey, "u", "Too many reset attempts"),
+                                              (ikey, "i", "Too many attempts from your network"),
+                                              (rkey, "r", "Too many recovery-code attempts")])
+            if blocked: return blocked
+            u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+            if not u:
+                authsec.verify_pw(newpw, _DUMMY_HASH, _DUMMY_SALT)   # equalize timing
+                authsec.throttle_fail(c, ukey, "u", commit=False)
+                authsec.throttle_fail(c, rkey, "r", commit=False)
+                wait = authsec.throttle_fail(c, ikey, "i")
+                authsec.log_event(c, "reset_fail", name=name, ip=ip, detail="no such user")
+                if wait > 0: return self._throttled(wait, "Too many reset attempts")
+                return self._err(self.RESET_FAIL, 400)
+            if not authsec.valid_code_shape(rcode) or not consume_recovery_code(c, u["id"], rcode, ip):
+                authsec.throttle_fail(c, ukey, "u", commit=False)
+                authsec.throttle_fail(c, rkey, "r", commit=False)
+                wait = authsec.throttle_fail(c, ikey, "i")
+                authsec.log_event(c, "reset_fail", user_id=u["id"], name=name, ip=ip,
+                                  detail="bad recovery code")
+                if wait > 0: return self._throttled(wait, "Too many reset attempts")
+                return self._err(self.RESET_FAIL, 400)
+            # The recovery code was correct: rotate the password, invalidate
+            # EVERY session that existed before this moment (including one an
+            # attacker may be holding), then hand out a fresh one.
+            salt = new_salt()
+            c.execute("UPDATE users SET pass_hash=?, salt=?, pw_changed_at=? WHERE id=?",
+                      (hash_pw(newpw, salt), salt, now_iso(), u["id"]))
+            c.commit()
+            revoke_sessions(c, u["id"])
             token = self._make_session(c, u["id"])
-            return self._send({"ok": True, "token": token},
+            authsec.throttle_clear(c, ukey, commit=False)
+            authsec.throttle_clear(c, rkey, commit=False)
+            authsec.throttle_clear(c, ikey)
+            authsec.log_event(c, "reset_ok", user_id=u["id"], name=u["name"], ip=ip,
+                              detail="sessions revoked")
+            st = recovery_status(c, u["id"])
+            return self._send({"ok": True, "token": token, "name": u["name"],
+                               "recoveryRemaining": st["remaining"]},
                               extra_headers=[("Set-Cookie", self._cookie_header(token))])
         finally:
             c.close()
 
-    def reset_password(self, body):
-        name = (body.get("name") or "").strip()
-        code = (body.get("code") or "").strip().upper()
-        newpw = (body.get("newPassword") or "").strip()
-        if not name: return self._err("Enter your name.")
-        if not code: return self._err("Enter your 6-letter friend code.")
-        if len(newpw) < 4: return self._err("New password must be at least 4 characters.")
-        c = db()
-        try:
-            u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
-            if not u: return self._err("No account found with that name.", 404)
-            if (u["code"] or "").strip().upper() != code:
-                return self._err("Incorrect 6-letter friend code for this account.", 400)
-            salt = hashlib.sha256(os.urandom(16)).hexdigest()
-            c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?",
-                      (hash_pw(newpw, salt), salt, u["id"]))
-            c.commit()
-            token = self._make_session(c, u["id"])
-            return self._send({"ok": True, "token": token, "name": u["name"]},
-                              extra_headers=[("Set-Cookie", self._cookie_header(token))])
-        finally:
-            c.close()
+    # -------- account security (authenticated)
+    def security_info(self, c, uid):
+        return self._send({"recovery": recovery_status(c, uid),
+                           "sessions": active_sessions(c, uid),
+                           "minPasswordLength": authsec.PW_MIN})
+
+    def regenerate_recovery_codes(self, c, uid, body):
+        """Issue a brand-new set (old unused ones are destroyed). Returns the
+        plaintext exactly once — the database only ever keeps digests."""
+        codes = issue_recovery_codes(c, uid, self._client_ip())
+        return self._send({"ok": True, "recoveryCodes": codes,
+                           "recovery": recovery_status(c, uid)})
+
+    def revoke_all_sessions(self, c, uid, body):
+        """Log out every device except the one making this request."""
+        keep = None
+        tok = self._cookie_token() or self._bearer_token()
+        if tok: keep = tok
+        revoke_sessions(c, uid, keep_token=keep)
+        authsec.log_event(c, "sessions_revoked", user_id=uid, ip=self._client_ip(),
+                          detail="user initiated")
+        return self._send({"ok": True, "sessions": active_sessions(c, uid)})
+
 
     def update_me(self, c, uid, body):
         fields = {}
@@ -1104,9 +1624,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def friend_connect(self, c, user, body):
         code = (body.get("code") or "").strip().upper()
         if not re.fullmatch(r"[A-Z0-9]{4,10}", code): return self._err("Enter a valid friend code.")
+        # A friend code identifies an account, so cap how fast one signed-in
+        # user can trawl the code space looking for people.
+        fkey = authsec.throttle_key("f", "u%d" % user["id"])
+        wait = authsec.throttle_remaining(c, fkey)
+        if wait: return self._throttled(wait, "Too many friend-code lookups")
         if code == user["code"]: return self._err("That's your own code.")
         pu = c.execute("SELECT * FROM users WHERE code=?", (code,)).fetchone()
-        if not pu: return self._err("No user with that code.")
+        if not pu:
+            authsec.throttle_fail(c, fkey, "f")
+            return self._err("No user with that code.")
+        authsec.throttle_clear(c, fkey)
         if are_friends(c, user["id"], pu["id"]):
             return self._send({"ok": True, "partner": pu["name"], "already": True})
         n = c.execute("SELECT COUNT(*) n FROM friendships WHERE user_id=?", (user["id"],)).fetchone()["n"]
@@ -1642,34 +2170,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
         c.execute("UPDATE reports SET resolved=1 WHERE id=?", (rid,)); c.commit()
         return self._send({"ok": True})
 
+    def _set_password(self, c, uid, newpw, keep_token=None, actor_id=None,
+                      ip=None, kind="password_changed", target_name=None):
+        """Single code path for every password write (self-change, self-reset,
+        admin-set) so the policy, the salt rotation, the session revocation and
+        the audit entry can never be skipped by one of them."""
+        salt = new_salt()
+        now = now_iso()
+        c.execute("UPDATE users SET pass_hash=?, salt=?, pw_changed_at=? WHERE id=?",
+                  (hash_pw(newpw, salt), salt, now, uid))
+        c.commit()
+        # Any session minted before this password change is destroyed: whoever
+        # held it (including an attacker) loses access at the same moment.
+        revoke_sessions(c, uid, keep_token=keep_token)
+        if keep_token:
+            # the surviving session must not look older than pw_changed_at, or
+            # the _auth() freshness guard would reject it straight away
+            c.execute("UPDATE sessions SET created_at=?, expires_at=? WHERE token=?",
+                      (now, time.time() + authsec.SESSION_TTL_SECONDS,
+                       authsec.hash_token(keep_token)))
+            c.commit()
+        authsec.log_event(c, kind, user_id=uid, name=target_name, ip=ip,
+                          detail=("by admin id=%s" % actor_id) if actor_id else None)
+        return salt
+
     def admin_set_password(self, c, uid, body):
         if not self.is_admin(c, uid): return self._err("Admin only.", 403)
         target = body.get("userId")
         try: target = int(target)
         except Exception: pass
-        newpw = (body.get("password") or "").strip()
-        if len(newpw) < 4: return self._err("Password must be at least 4 characters.")
-        r = c.execute("SELECT id FROM users WHERE id=?", (target,)).fetchone() if target is not None else None
-        if not r: return self._err("User not found.")
-        salt = hashlib.sha256(os.urandom(16)).hexdigest()
-        c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (hash_pw(newpw, salt), salt, target))
-        # existing sessions for that user stay valid; admin can tell them the new password
-        c.commit()
-        return self._send({"ok": True})
+        newpw = body.get("password")
+        if not isinstance(newpw, str): return self._err("Invalid password.")
+        tr = c.execute("SELECT id,name FROM users WHERE id=?", (target,)).fetchone() if target is not None else None
+        if not tr: return self._err("User not found.")
+        pol = authsec.password_policy_error(newpw, tr["name"])
+        if pol: return self._err(pol)
+        # Changing somebody else's password signs them out everywhere on
+        # purpose — the old credential must stop working immediately.
+        keep = None
+        if target == uid:
+            keep = self._cookie_token() or self._bearer_token()
+        self._set_password(c, target, newpw, keep_token=keep, actor_id=uid,
+                           ip=self._client_ip(), kind="admin_set_password",
+                           target_name=tr["name"])
+        return self._send({"ok": True, "revokedSessions": not keep})
 
     def change_my_password(self, c, uid, body):
-        curpw = (body.get("currentPassword") or "").strip()
-        newpw = (body.get("newPassword") or "").strip()
-        if len(newpw) < 4: return self._err("New password must be at least 4 characters.")
-        u = c.execute("SELECT pass_hash, salt FROM users WHERE id=?", (uid,)).fetchone()
+        curpw = body.get("currentPassword")
+        newpw = body.get("newPassword")
+        ip = self._client_ip()
+        if not isinstance(newpw, str): return self._err("Invalid password.")
+        u = c.execute("SELECT id,name,pass_hash,salt FROM users WHERE id=?", (uid,)).fetchone()
         if not u: return self._err("User not found.", 404)
+        pol = authsec.password_policy_error(newpw, u["name"])
+        if pol: return self._err(pol)
         is_adm = self.is_admin(c, uid)
+        curpw = curpw if isinstance(curpw, str) else ""
         if not is_adm or curpw:
-            if not hmac_mod.compare_digest(u["pass_hash"], hash_pw(curpw, u["salt"])):
+            ok, legacy = authsec.verify_pw(curpw, u["pass_hash"], u["salt"])
+            if not ok:
+                authsec.log_event(c, "pw_change_fail", user_id=uid, name=u["name"], ip=ip,
+                                  detail="wrong current password")
                 return self._err("Current password is incorrect.", 400)
-        salt = hashlib.sha256(os.urandom(16)).hexdigest()
-        c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?", (hash_pw(newpw, salt), salt, uid))
-        c.commit()
+        if authsec.verify_pw(newpw, u["pass_hash"], u["salt"])[0]:
+            return self._err("New password must be different from the current one.")
+        # keep THIS device signed in; every other session is revoked
+        keep = self._cookie_token() or self._bearer_token()
+        self._set_password(c, uid, newpw, keep_token=keep, ip=ip,
+                           kind="password_changed", target_name=u["name"])
         return self._send({"ok": True})
 
     def update_settings(self, c, uid, s, body):
