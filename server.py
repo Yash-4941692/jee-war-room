@@ -1102,6 +1102,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._restore_vercel_path()
         u = urlparse(self.path); p = u.path; q = parse_qs(u.query)
         if p == "/healthz":
+            # Boot/config state is reported even when the DB is down — that is
+            # exactly when an operator needs it (visible without Vercel logs).
+            def _boot_block(d):
+                d["bootOk"] = bool(BOOT_INFO.get("ok"))
+                if BOOT_INFO.get("error"):
+                    d["bootError"] = str(BOOT_INFO["error"])[:500]
+                d["cloud"] = bool(dbwrap.CLOUD)
+                d["vercelEnv"] = os.environ.get("VERCEL_ENV", "local")
+                return d
             try:
                 import time as _t, os as _os
                 t0 = _t.time()
@@ -1115,11 +1124,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                query_ms=int((t2 - t1) * 1000),
                                total_ms=int((t2 - t0) * 1000),
                                region=_os.environ.get("VERCEL_REGION", "local"))
-                    # Boot/migration outcome from the entry point: a failed
-                    # init_db() used to be invisible until users hit 500s.
-                    out["bootOk"] = bool(BOOT_INFO.get("ok"))
-                    if BOOT_INFO.get("error"):
-                        out["bootError"] = str(BOOT_INFO["error"])[:500]
+                    _boot_block(out)
                     # Lets the admin confirm the one-way auth migration actually
                     # ran on PRODUCTION (a preview deployment deliberately skips
                     # it, so this is how you tell the two apart).
@@ -1127,7 +1132,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         pend = pending_migrations(hc)
                         out["pendingMigrations"] = pend
                         out["destructiveMigrationsAllowed"] = destructive_migrations_allowed()
-                        out["vercelEnv"] = _os.environ.get("VERCEL_ENV", "local")
                     except Exception:
                         pass
                 hc.close()
@@ -1139,10 +1143,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     sys.stderr.flush()
                 except Exception:
                     pass
-                msg = "db unavailable"
-                if BOOT_INFO.get("error"):
-                    msg += " (boot error: %s)" % str(BOOT_INFO["error"])[:300]
-                return self._err(msg, 503)
+                return self._send(_boot_block({"ok": False, "error": "db unavailable"}), 503)
         if p.startswith("/api/"):
             # _auth() is INSIDE the try: an exception escaping the handler
             # sends no response at all (socket closed), and Vercel's proxy
