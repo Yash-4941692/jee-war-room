@@ -50,7 +50,16 @@
     (app.js clears the token on 401 and would silently sign everyone out).
   * `api/index.py` no longer swallows `init_db()` failures: the migration is
     retried lazily on every request and the outcome is reported at
-    `/healthz?detail=1` as `bootOk` / `bootError`.
+    `/healthz?detail=1` as `bootOk` / `bootError` (also on the 503 path, so a
+    dead DB cannot hide the boot state).
+  * dbwrap NEVER reuses a client it has closed: the old `_reconnect()` handed
+    the just-closed libsql client back out, and the next statement panicked
+    inside the Rust binding (`PanicException` is a `BaseException`, so it
+    escaped every handler as a response-less platform 500 — the other half of
+    the "Request failed (500)" bug). All panics are now converted to ordinary
+    `RuntimeError`s and poisoned clients replaced. Cloud `executescript`
+    strips `--` comments before splitting (a `;` inside the recovery_codes
+    comment used to break the DDL with "incomplete input").
 - **v8 features:** admin-only 📢 Announce composer + per-user unread banner on
   Home/Today (`announcements` table; read state in settings.seenAnnouncements);
   admin 👥 Registered Users panel with password RESET (passwords are PBKDF2

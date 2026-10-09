@@ -79,10 +79,12 @@ def _fresh_after_connect(deadline=None):
         try:
             # suspended databases can take ~20-30 s to wake the first time
             f.result(timeout=wait_deadline)
-        except Exception:
+        except BaseException as e:
             try: inner.close()
-            except Exception: pass
-            raise
+            except BaseException: pass
+            if isinstance(e, Exception):
+                raise
+            raise _client_crash(e)   # never leak a PanicException upward
         _tls.inner = inner
         _tls.last_used = time.time()
         _last_wake[0] = time.time()
@@ -92,6 +94,17 @@ _READ_OK = ("SELECT", "PRAGMA", "WITH", "CREATE", "INSERT OR REPLACE", "INSERT O
 def _is_safe_to_retry(sql):
     head = sql.lstrip().upper()
     return head.startswith(_READ_OK)
+
+
+def _client_crash(e):
+    """The libsql binding raises Rust-side panics as pyo3 PanicException — a
+    BaseException, NOT an Exception. Letting one escape kills the request with
+    no response at all (Vercel answers a non-JSON platform 500: the bare
+    'Request failed (500)'). Every such crash is converted to a plain
+    RuntimeError here so the normal error handling (JSON 500, retry-safe
+    reconnect) applies. A crashed client is always poisoned: replace it."""
+    return RuntimeError("database client crashed (%s: %s)"
+                        % (type(e).__name__, str(e)[:120]))
 
 
 class Row:
@@ -217,10 +230,18 @@ class _Conn:
         self._inner = _fresh_after_connect()
 
     def _reconnect(self):
+        old = self._inner
+        # CRITICAL: clear the thread-local slot FIRST. _fresh_after_connect()
+        # returns whatever sits there, and forgetting to clear it used to hand
+        # back the very client we are about to close — the next statement then
+        # ran on a CLOSED libsql connection, which panics inside the Rust
+        # binding (a BaseException that escapes every handler as a platform
+        # 500 with no JSON body).
+        _tls.inner = None
         try:
-            f = _pool.submit(self._inner.close)
+            f = _pool.submit(old.close)
             try: f.result(timeout=2)
-            except Exception: pass
+            except BaseException: pass   # even a panicking close must not block
         except Exception: pass
         self._inner = _fresh_after_connect()
 
@@ -251,6 +272,16 @@ class _Conn:
             if not CLOUD or retried or not _is_safe_to_retry(sql): raise
             self._reconnect()
             return self._run(sql, params, many, retried=True)
+        except BaseException as e:
+            # Rust panic inside the binding (e.g. a statement on a poisoned
+            # client). A BaseException would escape every `except Exception`
+            # up the stack and kill the request with no JSON response, so it
+            # is converted; a safe-to-retry statement gets ONE retry on a
+            # guaranteed-fresh client.
+            if not CLOUD or retried or not _is_safe_to_retry(sql):
+                raise _client_crash(e)
+            self._abandon()
+            return self._run(sql, params, many, retried=True)
 
     def execute(self, sql, params=()):
         return _Cur(self._run(sql, params, False), self)
@@ -265,7 +296,11 @@ class _Conn:
             self._inner.executescript(script); return self
         if time.time() - getattr(_tls, "last_used", 0.0) > 20:
             self._reconnect()
-        stmts = [s.strip() for s in script.split(";") if s.strip()]
+        # Strip `--` comments BEFORE splitting: the DDL contains semicolons
+        # inside comments (e.g. the recovery_codes one), which a naive
+        # split(";") turns into an "incomplete input" statement.
+        cleaned = re.sub(r"--[^\n]*", "", script)
+        stmts = [s.strip() for s in cleaned.split(";") if s.strip()]
         for s in stmts:
             self.execute(s)
         return self
@@ -283,6 +318,11 @@ class _Conn:
         except Exception:
             if not CLOUD: raise
             self._reconnect()
+        except BaseException as e:
+            # Rust panic: the client is poisoned, replace it; a commit crash
+            # must surface as a normal exception so the handler answers JSON.
+            if not CLOUD: raise _client_crash(e)
+            self._abandon()
 
     def rollback(self):
         try:
@@ -290,6 +330,8 @@ class _Conn:
             f.result(timeout=DB_TIMEOUT)
         except Exception:
             if CLOUD: self._reconnect()
+        except BaseException:
+            if CLOUD: self._abandon()
 
     def close(self):
         # Cloud: keep the cached client alive for the next request on this
@@ -301,8 +343,8 @@ class _Conn:
             try:
                 if getattr(self._inner, "in_transaction", False):
                     self._inner.rollback()
-            except Exception:
-                pass
+            except BaseException:
+                pass   # even a panicking client must not break request teardown
 
     # PRAGMA table_info shim used by the migration code
     def table_columns(self, tbl):
@@ -359,7 +401,7 @@ def db():
         try:
             f = _pool.submit(inner.close)
             try: f.result(timeout=2)
-            except Exception: pass
+            except BaseException: pass   # even a panicking close must not escape
         except Exception: pass
         inner = None
     if inner is None:
