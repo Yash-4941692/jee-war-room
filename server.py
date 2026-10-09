@@ -17,6 +17,7 @@ SECURITY MODEL (see SECURITY.md for the full write-up)
 """
 import http.server, socketserver, json, sqlite3, os, re, sys, time, math, random, string, secrets
 import hashlib, hmac as hmac_mod
+import threading
 import traceback
 import authsec
 from datetime import date, datetime, timedelta
@@ -245,6 +246,42 @@ def _table_cols(c, table):
         return set()
 
 
+# ---------------------------------------------------------------- schema tolerance
+# Cached answers to "does this database already have the hardened schema?".
+#   None  = unknown yet
+#   True  = full schema present (normal case after init_db())
+#   False = a request already hit "no such table/column" -> use the legacy shape
+# Migrations only ever ADD columns/tables, so once detected the answer is
+# stable for the life of the worker; init_db() resets the cache to full.
+_AUTH_COLS_FULL = [None]      # sessions.expires_at + users.pw_changed_at (+ role)
+_RC_TABLE_OK = [None]         # recovery_codes table present
+
+
+def _reset_schema_cache(full=True):
+    """Called by init_db() once the schema is known-good."""
+    _AUTH_COLS_FULL[0] = True if full else None
+    _RC_TABLE_OK[0] = True if full else None
+
+
+def _missing_schema(e):
+    """True when an error means a table/column does NOT exist.
+
+    Anything else is a TRANSIENT database failure and must surface as a 500:
+    turning it into a 401/no-user result would make app.js drop the stored
+    token and silently sign out every user on a passing Turso blip.
+    Degrade on missing schema, never deny on a blip.
+    """
+    m = str(e).lower()
+    return "no such table" in m or "no such column" in m
+
+
+# Boot/migration outcome, filled by the serverless entry point (api/index.py)
+# and by `python3 server.py`. Surfaced at GET /healthz?detail=1 so a failed
+# or half-applied migration is visible to the operator without log access —
+# it used to be swallowed by a bare `except` at import time.
+BOOT_INFO = {"ok": None, "error": None}
+
+
 def init_db():
     c = db()
     if dbwrap.CLOUD:
@@ -257,6 +294,7 @@ def init_db():
             if c.execute("SELECT 1 FROM schema_migrations WHERE name=?",
                          (MIGRATION_LEGACY_SESSION_PURGE,)).fetchone():
                 c.close()
+                _reset_schema_cache(full=True)
                 return
         except Exception:
             pass
@@ -284,6 +322,7 @@ def init_db():
             c.execute("ALTER TABLE chapters ADD COLUMN lectures_done INTEGER NOT NULL DEFAULT 0")
         _auth_migrate(c)
         c.commit(); c.close()
+        _reset_schema_cache(full=True)
         return
     c.executescript(_SCHEMA_SQL)
     # ---- lightweight migrations ----
@@ -301,6 +340,7 @@ def init_db():
         c.execute("ALTER TABLE messages ADD COLUMN hidden TEXT NOT NULL DEFAULT ''")
     _auth_migrate(c)
     c.commit(); c.close()
+    _reset_schema_cache(full=True)
 
 def seed_chapters(c, uid):
     """Insert the 61 default chapters for a user in ONE network round-trip
@@ -458,31 +498,55 @@ def purge_expired_sessions(c):
 
 
 # ---------------------------------------------------------------- recovery codes
-def issue_recovery_codes(c, uid, ip=None, commit=True):
+def issue_recovery_codes(c, uid, ip=None, commit=True, log=True):
     """Generate a fresh set of recovery codes; returns the PLAINTEXT list.
 
     Old unused codes are discarded so a lost printout can never be replayed
     later. This is the ONLY moment the plaintext exists — the database keeps
     SHA-256 digests, so nobody (not even the admin) can read them back.
+
+    All 8 codes are written in ONE multi-row INSERT: on Vercel every statement
+    is a separate HTTPS round trip to Turso inside a 7 s watchdog, and 8
+    sequential INSERTs on a waking database were enough on their own to blow
+    the function's 30 s budget (same lesson as signup's 61 chapter rows — see
+    STATUS.md). `log=False` lets login/signup fold the audit event into their
+    own batched log_events() call, saving yet another round trip.
+
+    Callers on the login/signup path treat a failure here as NON-FATAL: codes
+    are a convenience the user can regenerate in Settings → Account Security.
     """
     codes = authsec.gen_recovery_codes()
     now = now_iso()
     c.execute("DELETE FROM recovery_codes WHERE user_id=? AND used_at IS NULL", (uid,))
+    vals, params = [], []
     for code in codes:
-        c.execute("""INSERT OR IGNORE INTO recovery_codes(user_id,code_hash,created_at)
-                     VALUES(?,?,?)""", (uid, authsec.hash_code(code), now))
+        vals.append("(?,?,?)")
+        params.extend([uid, authsec.hash_code(code), now])
+    c.execute("""INSERT OR IGNORE INTO recovery_codes(user_id,code_hash,created_at) VALUES """
+              + ",".join(vals), params)
     if commit: c.commit()
-    authsec.log_event(c, "recovery_codes_issued", user_id=uid, ip=ip,
-                      detail="%d codes" % len(codes), commit=False)
+    _RC_TABLE_OK[0] = True          # the writes above prove the table exists
+    if log:
+        authsec.log_event(c, "recovery_codes_issued", user_id=uid, ip=ip,
+                          detail="%d codes" % len(codes), commit=commit)
     return codes
 
 
 def consume_recovery_code(c, uid, code, ip=None):
     """Use one unused recovery code. Returns True when it was valid."""
+    if _RC_TABLE_OK[0] is False:
+        return False              # schema not migrated yet: no code can exist
     digest = authsec.hash_code(code)
-    row = c.execute("""SELECT id FROM recovery_codes
-                       WHERE user_id=? AND code_hash=? AND used_at IS NULL""",
-                    (uid, digest)).fetchone()
+    try:
+        row = c.execute("""SELECT id FROM recovery_codes
+                           WHERE user_id=? AND code_hash=? AND used_at IS NULL""",
+                        (uid, digest)).fetchone()
+    except Exception as e:
+        if _RC_TABLE_OK[0] is not True and _missing_schema(e):
+            _RC_TABLE_OK[0] = False     # degrade: treat as "no such code"
+            return False
+        raise                     # transient DB failure: 500, not a fake reject
+    _RC_TABLE_OK[0] = True
     if not row: return False
     c.execute("UPDATE recovery_codes SET used_at=?, used_ip=? WHERE id=?",
               (now_iso(), (str(ip)[:64] if ip else None), row["id"]))
@@ -495,15 +559,30 @@ def recovery_status(c, uid):
 
     `total` is the size of the CURRENT batch, not of all history — used codes
     from superseded batches would otherwise make the counter look wrong.
+
+    Schema-tolerant: on a database whose migration has not landed yet the
+    answer degrades to "no codes" instead of raising a 500 on every request.
+    Transient DB failures still raise — they must surface as a 500, never as
+    a result that signs somebody out or blocks a login.
     """
-    r = c.execute("""SELECT
-            (SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?) generated_at,
-            (SELECT MAX(used_at) FROM recovery_codes WHERE user_id=?) last_used_at,
-            (SELECT COUNT(*) FROM recovery_codes WHERE user_id=? AND used_at IS NULL) remaining,
-            (SELECT COUNT(*) FROM recovery_codes WHERE user_id=?
-              AND created_at=(SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?)) total
-        """, (uid, uid, uid, uid, uid)).fetchone()
-    if not r: return {"total": 0, "remaining": 0, "generatedAt": None, "lastUsedAt": None}
+    empty = {"total": 0, "remaining": 0, "generatedAt": None, "lastUsedAt": None}
+    if _RC_TABLE_OK[0] is False:
+        return empty
+    try:
+        r = c.execute("""SELECT
+                (SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?) generated_at,
+                (SELECT MAX(used_at) FROM recovery_codes WHERE user_id=?) last_used_at,
+                (SELECT COUNT(*) FROM recovery_codes WHERE user_id=? AND used_at IS NULL) remaining,
+                (SELECT COUNT(*) FROM recovery_codes WHERE user_id=?
+                  AND created_at=(SELECT MAX(created_at) FROM recovery_codes WHERE user_id=?)) total
+            """, (uid, uid, uid, uid, uid)).fetchone()
+    except Exception as e:
+        if _RC_TABLE_OK[0] is not True and _missing_schema(e):
+            _RC_TABLE_OK[0] = False
+            return empty
+        raise
+    _RC_TABLE_OK[0] = True
+    if not r: return empty
     return {"total": int(r["total"] or 0), "remaining": int(r["remaining"] or 0),
             "generatedAt": r["generated_at"], "lastUsedAt": r["last_used_at"]}
 
@@ -768,6 +847,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "JEEWR/1.0"
     def log_message(self, *a): pass
 
+    # Endpoints that authenticate a brand-new (token-less) device. `_auth()`
+    # is skipped for them entirely: with no token it could only return None,
+    # but on a half-migrated schema it could also fail — a pointless risk and
+    # a wasted round trip on the exact requests a locked-out user depends on.
+    AUTH_FREE_PATHS = frozenset(("/api/auth/signup", "/api/auth/login",
+                                 "/api/auth/reset-password"))
+
+    def send_error(self, code, message=None, explain=None):
+        """JSON instead of the stdlib HTML error page.
+
+        Even low-level failures (malformed request line, unsupported method,
+        oversized URI) must answer with a machine-readable body: a non-JSON
+        error is exactly what turns into the bare "Request failed (500)" toast
+        in the frontend, because api() only finds an `error` field in JSON.
+        """
+        self.close_connection = True
+        try:
+            self._err(str(message or explain or "Request error")[:200], code)
+        except Exception:
+            pass    # the socket is already gone; nothing to send
+
     # ---------------------------------------------------- hardening helpers
     def _security_headers(self):
         """Defence-in-depth headers on EVERY response (API and static).
@@ -925,25 +1025,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         return m.group(1).strip().lower() in self._expected_hosts()
 
+    # The DB stores SHA-256(token), so a dump of the sessions table is useless
+    # to an attacker. Sessions also expire, and any session created before the
+    # last password change is rejected outright (belt-and-braces behind
+    # revoke_sessions()). Only NON-secret user columns are selected: the
+    # credential hash never travels around inside the request-scoped user dict.
+    _AUTH_SQL_FULL = """SELECT u.id, u.name, u.code, u.partner_id, u.role,
+                               u.exam_date, u.avatar_color, u.created_at,
+                               s.token AS _sess, s.created_at AS _sess_at
+                          FROM sessions s JOIN users u ON u.id=s.user_id
+                         WHERE s.token=?
+                           AND (s.expires_at IS NULL OR s.expires_at=0 OR s.expires_at>?)
+                           AND (u.pw_changed_at IS NULL OR s.created_at>=u.pw_changed_at)"""
+    # Pre-hardening shape (no expires_at / pw_changed_at / role): used only
+    # after a request has SEEN those columns missing, so a partial migration
+    # DEGRADES (weaker checks, admin panel reads role from the DB instead of
+    # the session) instead of 500-ing on every authenticated request.
+    _AUTH_SQL_LEGACY = """SELECT u.id, u.name, u.code, u.partner_id,
+                                 u.exam_date, u.avatar_color, u.created_at,
+                                 s.token AS _sess, s.created_at AS _sess_at
+                            FROM sessions s JOIN users u ON u.id=s.user_id
+                           WHERE s.token=?"""
+
     def _auth(self):
         token = self._cookie_token() or self._bearer_token()
         if not token: return None
+        digest = authsec.hash_token(token)
         c = db()
         try:
-            # The DB stores SHA-256(token), so a dump of the sessions table is
-            # useless to an attacker. Sessions also expire, and any session
-            # created before the last password change is rejected outright
-            # (belt-and-braces behind revoke_sessions()).
-            # Only NON-secret user columns are selected: the credential hash
-            # never travels around inside the request-scoped user dict.
-            r = c.execute("""SELECT u.id, u.name, u.code, u.partner_id, u.role,
-                                    u.exam_date, u.avatar_color, u.created_at,
-                                    s.token AS _sess, s.created_at AS _sess_at
-                               FROM sessions s JOIN users u ON u.id=s.user_id
-                              WHERE s.token=?
-                                AND (s.expires_at IS NULL OR s.expires_at=0 OR s.expires_at>?)
-                                AND (u.pw_changed_at IS NULL OR s.created_at>=u.pw_changed_at)""",
-                          (authsec.hash_token(token), time.time())).fetchone()
+            if _AUTH_COLS_FULL[0] is False:
+                r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
+            else:
+                try:
+                    r = c.execute(self._AUTH_SQL_FULL, (digest, time.time())).fetchone()
+                    _AUTH_COLS_FULL[0] = True
+                except Exception as e:
+                    # CRITICAL: only a PROVABLY missing column/table degrades to
+                    # the legacy shape. A transient DB failure must re-raise and
+                    # become a 500 — returning None here would send a 401, and
+                    # app.js clears the stored token on 401, silently signing
+                    # out every user on a passing Turso blip. Degrade, don't deny.
+                    if _AUTH_COLS_FULL[0] is True or not _missing_schema(e):
+                        raise
+                    _AUTH_COLS_FULL[0] = False
+                    r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
         finally:
             c.close()
         return dict(r) if r else None
@@ -990,6 +1115,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                query_ms=int((t2 - t1) * 1000),
                                total_ms=int((t2 - t0) * 1000),
                                region=_os.environ.get("VERCEL_REGION", "local"))
+                    # Boot/migration outcome from the entry point: a failed
+                    # init_db() used to be invisible until users hit 500s.
+                    out["bootOk"] = bool(BOOT_INFO.get("ok"))
+                    if BOOT_INFO.get("error"):
+                        out["bootError"] = str(BOOT_INFO["error"])[:500]
                     # Lets the admin confirm the one-way auth migration actually
                     # ran on PRODUCTION (a preview deployment deliberately skips
                     # it, so this is how you tell the two apart).
@@ -1009,14 +1139,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     sys.stderr.flush()
                 except Exception:
                     pass
-                return self._err("db unavailable", 503)
+                msg = "db unavailable"
+                if BOOT_INFO.get("error"):
+                    msg += " (boot error: %s)" % str(BOOT_INFO["error"])[:300]
+                return self._err(msg, 503)
         if p.startswith("/api/"):
-            user = self._auth()
-            if not user: return self._err("Not authenticated", 401)
-            try: return self.api_get(user, p, q)
+            # _auth() is INSIDE the try: an exception escaping the handler
+            # sends no response at all (socket closed), and Vercel's proxy
+            # answers with a non-JSON 500 — the "Request failed (500)" bug.
+            # Every failure must reach _server_error's JSON body instead.
+            try:
+                user = self._auth()
+                if not user: return self._err("Not authenticated", 401)
+                return self.api_get(user, p, q)
             except Exception:
                 return self._server_error(p)
-        return self.static(p)
+        try:
+            return self.static(p)
+        except Exception:
+            return self._server_error(p)
 
     def _server_error(self, p):
         """Never echo exception text to the client: it leaks schema, paths and
@@ -1040,17 +1181,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._restore_vercel_path()
         u = urlparse(self.path); p = u.path
         if p.startswith("/api/"):
-            # CSRF: cookie-authenticated POSTs must be same-origin JSON.
-            # (Production sets SameSite=None; Secure so the app can be
-            # embedded/proxied, which makes this check the real CSRF defence.)
-            if not self._csrf_ok():
-                return self._err("Cross-site request blocked.", 403)
-            body = self._body()
-            if body is None: return self._err("Invalid request body")
-            auth_free = (p in ("/api/auth/signup", "/api/auth/login", "/api/auth/reset-password"))
-            user = self._auth()
-            if not user and not auth_free: return self._err("Not authenticated", 401)
-            try: return self.api_post(user, p, body)
+            # _csrf_ok()/_auth() are INSIDE the try: an exception escaping the
+            # handler sends no response at all (socket closed), and Vercel's
+            # proxy answers with a non-JSON 500 — the "Request failed (500)"
+            # bug. Every failure must reach _server_error's JSON body instead.
+            try:
+                # CSRF: cookie-authenticated POSTs must be same-origin JSON.
+                # (Production sets SameSite=None; Secure so the app can be
+                # embedded/proxied, which makes this check the real CSRF defence.)
+                if not self._csrf_ok():
+                    return self._err("Cross-site request blocked.", 403)
+                body = self._body()
+                if body is None: return self._err("Invalid request body")
+                auth_free = p in self.AUTH_FREE_PATHS
+                # A new device has no token on signup/login/reset: skip _auth()
+                # there entirely (pure risk and a wasted round trip).
+                user = None if auth_free else self._auth()
+                if not user and not auth_free: return self._err("Not authenticated", 401)
+                return self.api_post(user, p, body)
             except Exception:
                 return self._server_error(p)
         self._err("Not found", 404)
@@ -1082,6 +1230,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ============================================================ GET API
     def api_get(self, user, p, q):
+        # Cheap (a timestamp comparison): gives the background cleanup a chance
+        # to run on warm read traffic, never on the latency-critical auth paths.
+        self._kick_housekeeping()
         c = db(); uid = user["id"]; s = get_settings(c, uid)
         if s.get("sweepDay") != TODAY():
             sweep_targets(c, uid, s)
@@ -1467,14 +1618,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return _make_session_row(c, uid, self.headers.get("User-Agent"))
 
     def _throttle_gate(self, c, keys):
-        """Return a 429 response if any of the given throttle keys is locked."""
-        wait, worst = 0.0, "Too many attempts"
-        for key, _kind, label in keys:
-            w = authsec.throttle_remaining(c, key)
-            if w > wait:
-                wait, worst = w, label
+        """Return a 429 response if any of the given throttle keys is locked.
+
+        All keys are checked in ONE query: on Vercel each statement is a
+        separate Turso round trip, and the gate used to cost one per key.
+        """
+        wait, key = authsec.throttle_worst(c, [k for k, _kind, _label in keys])
         if wait > 0:
-            return self._throttled(wait, worst)
+            label = {k: lab for k, _kind, lab in keys}.get(key) or "Too many attempts"
+            return self._throttled(wait, label)
         return None
 
     def signup(self, body):
@@ -1517,11 +1669,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,0,600000)", (uid, TODAY()))
             c.commit()
             token = self._make_session(c, uid)
-            # Recovery codes are shown to the user exactly once, right here.
-            codes = issue_recovery_codes(c, uid, ip)
-            authsec.log_event(c, "signup_ok", user_id=uid, name=name, ip=ip)
-            return self._send({"ok": True, "code": code, "token": token, "recoveryCodes": codes},
-                              extra_headers=[("Set-Cookie", self._cookie_header(token))])
+            # Recovery codes are shown to the user exactly once, right here —
+            # but issuance is BEST-EFFORT: codes are a convenience the user can
+            # regenerate in Settings → Account Security, so a failure must never
+            # sink the signup itself (the account + session already exist).
+            events = [("signup_ok", uid, name, ip, None)]
+            codes = None
+            if _RC_TABLE_OK[0] is not False:
+                try:
+                    codes = issue_recovery_codes(c, uid, ip, log=False)
+                    events.append(("recovery_codes_issued", uid, None, ip,
+                                   "%d codes" % len(codes)))
+                except Exception:
+                    try: c.rollback()   # drop any half-written code rows
+                    except Exception: pass
+                    events.append(("recovery_codes_failed", uid, None, ip,
+                                   "issuance failed on signup; user can regenerate in Settings"))
+            authsec.log_events(c, events)   # one batched INSERT, then commit
+            out = {"ok": True, "code": code, "token": token}
+            if codes: out["recoveryCodes"] = codes
+            return self._send(out, extra_headers=[("Set-Cookie", self._cookie_header(token))])
         finally:
             c.close()
 
@@ -1537,7 +1704,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             blocked = self._throttle_gate(c, [(ukey, "u", "Too many failed sign-ins"),
                                               (ikey, "i", "Too many failed sign-ins from your network")])
             if blocked: return blocked
-            u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+            # Fetch the user AND the size of their recovery-code batch in ONE
+            # round trip: the batch size decides whether first-login codes get
+            # issued (it used to cost a separate recovery_status() SELECT).
+            # Schema-tolerant like _auth(): a half-migrated DB degrades to the
+            # plain lookup instead of failing the login.
+            if _RC_TABLE_OK[0] is False:
+                u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+            else:
+                try:
+                    u = c.execute("""SELECT u.*,
+                                            (SELECT COUNT(*) FROM recovery_codes rc
+                                              WHERE rc.user_id=u.id) AS rc_total
+                                       FROM users u WHERE u.name=? COLLATE NOCASE""",
+                                  (name,)).fetchone()
+                    _RC_TABLE_OK[0] = True
+                except Exception as e:
+                    if _RC_TABLE_OK[0] is not True and _missing_schema(e):
+                        _RC_TABLE_OK[0] = False
+                        u = c.execute("SELECT * FROM users WHERE name=? COLLATE NOCASE",
+                                      (name,)).fetchone()
+                    else:
+                        raise
             if u:
                 ok, legacy = authsec.verify_pw(pw, u["pass_hash"], u["salt"])
             else:
@@ -1564,31 +1752,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 c.execute("UPDATE users SET pass_hash=?, salt=? WHERE id=?",
                           (hash_pw(pw, salt), salt, u["id"]))
                 c.commit()
-            authsec.throttle_clear(c, ukey, commit=False)
-            authsec.throttle_clear(c, ikey)
-            self._housekeeping(c)
+            # One DELETE for both counters (used to be two round trips).
+            authsec.throttle_clear_many(c, [ukey, ikey], commit=False)
+            # Cleanup is kicked into a background worker — it NEVER runs inline
+            # on the login path (it used to add 3 DELETEs to the first login
+            # after every cold start, and on serverless _LAST_HOUSEKEEPING
+            # resets with each new worker, so that was effectively every login).
+            self._kick_housekeeping()
             uid = u["id"]
             token = self._make_session(c, uid)
-            out = {"ok": True, "token": token}
             # Accounts that predate recovery codes get a set on their first
             # successful sign-in after this upgrade — the UI shows it once.
-            if recovery_status(c, uid)["total"] == 0:
-                out["recoveryCodes"] = issue_recovery_codes(c, uid, ip)
-            authsec.log_event(c, "login_ok", user_id=uid, name=u["name"], ip=ip)
+            # Issuance is BEST-EFFORT: codes are a convenience the user can
+            # regenerate in Settings → Account Security, so a failure here must
+            # never sink the login itself (the token is already minted).
+            events = [("login_ok", uid, u["name"], ip, None)]
+            codes = None
+            rc_total = int(u["rc_total"] or 0) if _RC_TABLE_OK[0] is not False else None
+            if rc_total == 0:
+                try:
+                    codes = issue_recovery_codes(c, uid, ip, log=False)
+                    events.append(("recovery_codes_issued", uid, None, ip,
+                                   "%d codes" % len(codes)))
+                except Exception:
+                    try: c.rollback()   # drop any half-written code rows
+                    except Exception: pass
+                    events.append(("recovery_codes_failed", uid, None, ip,
+                                   "issuance failed on login; user can regenerate in Settings"))
+            # login_ok (+ code event) in ONE batched INSERT, then commit.
+            authsec.log_events(c, events)
+            out = {"ok": True, "token": token}
+            if codes: out["recoveryCodes"] = codes
             return self._send(out, extra_headers=[("Set-Cookie", self._cookie_header(token))])
         finally:
             c.close()
 
+    # At most once an hour per worker — and only ever in the background.
     _LAST_HOUSEKEEPING = [0.0]
+    _HK_BUSY = [False]
+    _HK_LOCK = threading.Lock()
 
-    def _housekeeping(self, c):
-        """At most once an hour per worker: drop expired sessions/old counters."""
+    def _kick_housekeeping(self):
+        """Kick the once-an-hour cleanup into a BACKGROUND worker.
+
+        Housekeeping used to run three extra DELETEs inline on the first login
+        after every cold start — right on the latency-critical path where every
+        statement is a Turso round trip against a 30 s budget. The request path
+        now never waits on cleanup; if the worker freezes before the background
+        thread finishes, the next worker simply tries again.
+        """
         now = time.time()
         if now - Handler._LAST_HOUSEKEEPING[0] < 3600: return
-        Handler._LAST_HOUSEKEEPING[0] = now
-        purge_expired_sessions(c)
-        authsec.throttle_housekeeping(c)
-        authsec.prune_events(c)
+        if not Handler._HK_LOCK.acquire(blocking=False): return
+        try:
+            if Handler._HK_BUSY[0]: return
+            if time.time() - Handler._LAST_HOUSEKEEPING[0] < 3600: return
+            Handler._HK_BUSY[0] = True
+            Handler._LAST_HOUSEKEEPING[0] = time.time()
+        finally:
+            Handler._HK_LOCK.release()
+        threading.Thread(target=Handler._housekeeping_bg, name="jwr-housekeeping",
+                         daemon=True).start()
+
+    @staticmethod
+    def _housekeeping_bg():
+        """Drop expired sessions / stale counters / old events — best effort."""
+        try:
+            c = db()
+            try:
+                purge_expired_sessions(c)
+                authsec.throttle_housekeeping(c)
+                authsec.prune_events(c)
+            finally:
+                c.close()
+        except Exception:
+            pass
+        finally:
+            Handler._HK_BUSY[0] = False
 
     def reset_password(self, body):
         """Self-service reset with a ONE-TIME RECOVERY CODE.
@@ -1649,9 +1889,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.commit()
             revoke_sessions(c, u["id"])
             token = self._make_session(c, u["id"])
-            authsec.throttle_clear(c, ukey, commit=False)
-            authsec.throttle_clear(c, rkey, commit=False)
-            authsec.throttle_clear(c, ikey)
+            # all three counters in ONE DELETE (used to be three round trips)
+            authsec.throttle_clear_many(c, [ukey, rkey, ikey])
             authsec.log_event(c, "reset_ok", user_id=u["id"], name=u["name"], ip=ip,
                               detail="sessions revoked")
             st = recovery_status(c, u["id"])
@@ -2524,6 +2763,7 @@ def backup_loop():
 
 if __name__ == "__main__":
     init_db()
+    BOOT_INFO["ok"] = True
     backup_db()          # snapshot at every boot
     backup_loop()        # then hourly
     print(f"JEE WAR ROOM running on http://0.0.0.0:{PORT}")

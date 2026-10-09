@@ -257,12 +257,51 @@ def throttle_fail(c, key, kind, now=None, commit=True):
 
 def throttle_clear(c, key, commit=True):
     """A successful authentication wipes the counter for that identity."""
+    throttle_clear_many(c, [key], commit=commit)
+
+
+def throttle_clear_many(c, keys, commit=True):
+    """Wipe the counters for ALL given identities with ONE DELETE.
+
+    On Vercel every statement is a separate HTTPS round trip to Turso, so a
+    successful login clearing its username AND IP counters must cost one
+    statement, not two (see the round-trip budget in STATUS.md).
+    """
+    ks = [k for k in keys if k]
+    if not ks:
+        return
     try:
-        c.execute("DELETE FROM auth_throttle WHERE key=?", (key,))
+        c.execute("DELETE FROM auth_throttle WHERE key IN (%s)" % ",".join("?" * len(ks)),
+                  tuple(ks))
         if commit:
             c.commit()
     except Exception:
         pass
+
+
+def throttle_worst(c, keys, now=None):
+    """(seconds still blocked, key) for the worst-locked of the given keys.
+
+    Checks every key in ONE query — the login/signup/reset gates used to issue
+    one SELECT per key. Returns (0.0, None) when nothing is locked (and on a
+    DB hiccup: throttling must never lock people out because of its own
+    storage).
+    """
+    if not keys:
+        return 0.0, None
+    now = time.time() if now is None else now
+    try:
+        ph = ",".join("?" * len(keys))
+        rows = c.execute("SELECT key, locked_until FROM auth_throttle WHERE key IN (%s)" % ph,
+                         tuple(keys)).fetchall()
+    except Exception:
+        return 0.0, None
+    wait, worst = 0.0, None
+    for r in rows:
+        until = float(r["locked_until"] or 0)
+        if until > now and until - now > wait:
+            wait, worst = until - now, r["key"]
+    return wait, worst
 
 
 def throttle_housekeeping(c, now=None):
@@ -290,15 +329,39 @@ def human_wait(seconds):
 EVENT_RETENTION_DAYS = 60
 
 
+def _event_ts():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _event_params(kind, user_id, name, ip, detail, ts):
+    return [ts, str(kind)[:40], user_id, (str(name)[:40] if name else None),
+            (str(ip)[:64] if ip else None), (str(detail)[:200] if detail else None)]
+
+
 def log_event(c, kind, user_id=None, name=None, ip=None, detail=None, commit=True):
     """Append-only audit trail for authentication activity (admin visible)."""
+    log_events(c, [(kind, user_id, name, ip, detail)], commit=commit)
+
+
+def log_events(c, events, commit=True):
+    """Batched audit writer: ONE multi-row INSERT for N events.
+
+    `events` is an iterable of (kind, user_id, name, ip, detail) tuples.
+    On Vercel every statement is a separate HTTPS round trip to Turso, so a
+    login that also issues recovery codes records both events in a single
+    statement instead of two.
+    """
     try:
-        from datetime import datetime, timezone
-        ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        c.execute("""INSERT INTO auth_events(ts,kind,user_id,name,ip,detail)
-                     VALUES(?,?,?,?,?,?)""",
-                  (ts, str(kind)[:40], user_id, (str(name)[:40] if name else None),
-                   (str(ip)[:64] if ip else None), (str(detail)[:200] if detail else None)))
+        ts = _event_ts()
+        rows, params = [], []
+        for (kind, user_id, name, ip, detail) in events:
+            rows.append("(?,?,?,?,?,?)")
+            params.extend(_event_params(kind, user_id, name, ip, detail, ts))
+        if not rows:
+            return
+        c.execute("""INSERT INTO auth_events(ts,kind,user_id,name,ip,detail) VALUES """
+                  + ",".join(rows), params)
         if commit:
             c.commit()
     except Exception:

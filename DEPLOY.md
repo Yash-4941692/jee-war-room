@@ -39,6 +39,27 @@ Variables: `APP_URL`
     python3 server.py                       # local SQLite at data/warroom.db
     TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... python3 server.py   # cloud DB
 
+## ⚠️ The login round-trip budget (hard constraint)
+
+On Vercel each SQL statement is a separate HTTPS round trip to Turso inside
+dbwrap's 7 s watchdog, and the function has a 30 s budget (`maxDuration: 30`
+in api/index.py). The new-device login of a pre-existing account must stay at
+**<= 8 statements, and a repeat login at <= 5** — anything more can blow the
+budget on a waking free-tier database, after which Vercel kills the function
+and the client sees a non-JSON platform 500 (the bare "Request failed (500)"
+toast; the login never completes).
+
+Keep it there by: batching every multi-row write into ONE statement (recovery
+codes, chapter seeds, audit events), checking/clearing throttle keys with a
+single `key IN (…)`, skipping `_auth()` on /api/auth/signup|login|reset-password,
+and never running housekeeping inline on an auth path (it runs in a background
+worker, once per worker-hour).
+
+Measure before merging any change to the auth paths:
+
+    python3 tools/diag_login_roundtrips.py    # prints the per-statement budget
+    python3 tools/repro_login_500.py          # un-/half-migrated DB must still answer JSON
+
 ## ⚠️ Preview deployments share the PRODUCTION database
 
 Vercel env vars (`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`) are set for
@@ -64,9 +85,17 @@ How the code defends against this (`server.py`):
 Verify after any deploy:
 
     curl -s "https://jee-war-room-three.vercel.app/healthz?detail=1"
+    # bootOk: true                     <- init_db() succeeded (else bootError
+    #                                     explains the failed/half migration;
+    #                                     it is retried lazily per request)
     # pendingMigrations: []            <- nothing owed
     # destructiveMigrationsAllowed: true
     # vercelEnv: "production"
+
+`api/index.py` runs `server.init_db()` on cold start, but no longer swallows a
+failure: the outcome is recorded in `server.BOOT_INFO`, retried lazily on every
+following request until it lands, and surfaced as `bootOk` / `bootError` at
+`/healthz?detail=1` — a failed migration is visible without reading logs.
 
 **Recommended permanent fix:** give preview deployments their own Turso
 database, or scope `TURSO_*` to Production only in Vercel → Settings →

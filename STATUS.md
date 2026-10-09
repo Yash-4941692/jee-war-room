@@ -20,7 +20,37 @@
   errors for unknown-user and wrong-password; password changes revoke other
   sessions; CSRF origin check on cookie-authenticated POSTs; CSP + nosniff +
   Referrer-Policy headers; auth_events audit trail (admin-only);
-  `tools/selftest_auth.py` (51 checks) and `tools/selftest_migration.py`.
+  `tools/selftest_auth.py` (58 checks) and `tools/selftest_migration.py`.
+- **Login round-trip budget (HARD CONSTRAINT):** on Vercel every SQL statement
+  is a separate HTTPS round trip to Turso inside dbwrap's 7 s watchdog, under
+  the function's 30 s budget (`maxDuration: 30`). A new-device login of a
+  pre-existing account may cost **<= 8 statements; a repeat login <= 5**
+  (verified by `tools/diag_login_roundtrips.py`; the pre-fix path cost 21/8
+  and blew the budget on a waking free-tier DB — Vercel killed the function
+  and the client saw a non-JSON platform 500 = the bare "Request failed (500)"
+  toast). Rules that keep it there:
+  * recovery codes are issued in ONE multi-row INSERT (like signup's 61
+    chapter rows), never per-code INSERTs;
+  * throttle gate = one `key IN (…)` SELECT; a successful auth clears all its
+    counters with one `key IN (…)` DELETE; audit events are one batched
+    multi-row INSERT per request;
+  * housekeeping (expired sessions / stale counters / old events) NEVER runs
+    inline on a login — it is kicked into a once-per-worker-hour background
+    thread (`jwr-housekeeping`) from login/api_get;
+  * recovery-code issuance is **best-effort / non-fatal**: if it fails, login
+    still returns the token and a `recovery_codes_failed` audit event; the
+    user regenerates codes in Settings → Account Security.
+  * `_csrf_ok()`/`_auth()` run INSIDE the handler try/except and `_auth()` is
+    skipped entirely on /api/auth/signup|login|reset-password; even stdlib
+    low-level errors (400/501) answer JSON — no request path may produce a
+    non-JSON error body (`tools/repro_login_500.py`).
+  * `_auth()`/`recovery_status()` are schema-tolerant: on a half-migrated DB
+    they DEGRADE to the pre-hardening query shape (cached detection) instead
+    of 500-ing — and a transient DB failure must stay a 500, never a 401
+    (app.js clears the token on 401 and would silently sign everyone out).
+  * `api/index.py` no longer swallows `init_db()` failures: the migration is
+    retried lazily on every request and the outcome is reported at
+    `/healthz?detail=1` as `bootOk` / `bootError`.
 - **v8 features:** admin-only 📢 Announce composer + per-user unread banner on
   Home/Today (`announcements` table; read state in settings.seenAnnouncements);
   admin 👥 Registered Users panel with password RESET (passwords are PBKDF2

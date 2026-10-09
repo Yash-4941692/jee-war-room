@@ -17,11 +17,36 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Fast read schema verification on cold start (DDL only if tables missing)
-try:
-    server.init_db()
-except Exception as _e:
-    print("init_db warning:", _e)
+
+def _ensure_db():
+    """Run (or retry) the schema migration.
+
+    A failure here used to be swallowed by a bare `except: print(...)` at
+    import time, so a failed or half-applied migration on Turso still booted
+    the app and then every /api/* request 500'd with no operator-visible
+    cause. Now the boot state is recorded in server.BOOT_INFO (surfaced at
+    GET /healthz?detail=1 as bootOk / bootError) and the migration is
+    retried lazily on every request until it succeeds.
+    """
+    if server.BOOT_INFO.get("ok"):
+        return
+    try:
+        server.init_db()
+    except Exception as e:
+        server.BOOT_INFO["ok"] = False
+        server.BOOT_INFO["error"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+        try:
+            print("init_db failed (retrying on next request):", server.BOOT_INFO["error"])
+        except Exception:
+            pass
+        return
+    server.BOOT_INFO["ok"] = True
+    server.BOOT_INFO["error"] = None
+
+
+# Attempt the migration on cold start. Failure is reported, not swallowed —
+# and each following request retries it until it lands.
+_ensure_db()
 
 
 class handler(server.Handler):
@@ -37,8 +62,10 @@ class handler(server.Handler):
 
     def do_GET(self):
         self._restore_path()
+        _ensure_db()
         super().do_GET()
 
     def do_POST(self):
         self._restore_path()
+        _ensure_db()
         super().do_POST()
