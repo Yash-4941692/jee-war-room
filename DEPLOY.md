@@ -39,6 +39,40 @@ Variables: `APP_URL`
     python3 server.py                       # local SQLite at data/warroom.db
     TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... python3 server.py   # cloud DB
 
+## ⚠️ Preview deployments share the PRODUCTION database
+
+Vercel env vars (`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`) are set for
+**production and preview**, and `api/index.py` runs `server.init_db()` at import
+time. So the first cold start of *any* PR preview deployment executes schema
+migrations against your **live** database — before you merge, and before you
+announce anything to your users.
+
+How the code defends against this (`server.py`):
+
+- **Additive** steps (tables, indexes, columns) run everywhere — the new code
+  needs them to work at all.
+- **Destructive, one-way** steps are gated by `destructive_migrations_allowed()`,
+  which returns False when `VERCEL_ENV=preview`. Override for a deliberate test
+  with `ALLOW_PREVIEW_MIGRATION=1`.
+- Each destructive step is recorded in the `schema_migrations` table, and the
+  purge targets only rows the pre-hardening code could have written
+  (`sessions.expires_at = 0`), so it is idempotent and can never sign out
+  somebody who logged in after the upgrade.
+- `init_db()`'s cloud fast path checks the migration record too, so a preview
+  that created the new tables cannot make production skip the purge.
+
+Verify after any deploy:
+
+    curl -s "https://jee-war-room-three.vercel.app/healthz?detail=1"
+    # pendingMigrations: []            <- nothing owed
+    # destructiveMigrationsAllowed: true
+    # vercelEnv: "production"
+
+**Recommended permanent fix:** give preview deployments their own Turso
+database, or scope `TURSO_*` to Production only in Vercel → Settings →
+Environment Variables. Until then, treat every PR preview as a deployment that
+touches live data.
+
 ## Database tooling
 
     python tools/turso_io.py migrate        # local SQLite -> Turso

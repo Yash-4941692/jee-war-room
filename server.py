@@ -140,10 +140,100 @@ _AUTH_DDL = r"""
     CREATE TABLE IF NOT EXISTS auth_events(
       id INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
       user_id INTEGER, name TEXT, ip TEXT, detail TEXT);
+    CREATE TABLE IF NOT EXISTS schema_migrations(
+      name TEXT PRIMARY KEY, applied_at TEXT NOT NULL, detail TEXT);
     CREATE INDEX IF NOT EXISTS ix_rc_user ON recovery_codes(user_id, used_at);
     CREATE INDEX IF NOT EXISTS ix_sess_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS ix_ae_ts ON auth_events(ts);
     """
+
+
+# One-time migration that must NOT run from a Vercel *preview* deployment:
+# in this project preview and production share the same Turso database, so a
+# preview cold start would otherwise perform a one-way auth migration against
+# live data (signing every real user out before the change is even merged).
+MIGRATION_LEGACY_SESSION_PURGE = "purge_legacy_plaintext_sessions"
+
+
+def destructive_migrations_allowed():
+    """False on Vercel preview deployments (override: ALLOW_PREVIEW_MIGRATION=1)."""
+    if os.environ.get("ALLOW_PREVIEW_MIGRATION", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return (os.environ.get("VERCEL_ENV") or "").strip().lower() != "preview"
+
+
+def _migration_done(c, name):
+    try:
+        return c.execute("SELECT 1 FROM schema_migrations WHERE name=?", (name,)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _record_migration(c, name, detail=""):
+    try:
+        c.execute("""INSERT OR IGNORE INTO schema_migrations(name,applied_at,detail)
+                     VALUES(?,?,?)""", (name, now_iso(), str(detail)[:200]))
+        c.commit()
+    except Exception:
+        pass
+
+
+def legacy_sessions_remaining(c):
+    """Sessions that only the PRE-hardening code could have written.
+
+    The hardened code always stores a real expiry, so `expires_at=0` marks a
+    legacy plaintext-token row. Keying the purge on that (rather than on "did I
+    just add the column?") makes it idempotent: it can never sign out somebody
+    who logged in after the upgrade, and a preview that added the column cannot
+    cause production to skip the purge.
+    """
+    try:
+        r = c.execute("SELECT COUNT(*) FROM sessions WHERE expires_at IS NULL OR expires_at=0").fetchone()
+        return int(r[0] or 0)
+    except Exception:
+        return -1
+
+
+def pending_migrations(c):
+    """Destructive migrations still owed — surfaced via /healthz?detail=1."""
+    out = []
+    if not _migration_done(c, MIGRATION_LEGACY_SESSION_PURGE):
+        out.append({"name": MIGRATION_LEGACY_SESSION_PURGE,
+                    "legacySessions": legacy_sessions_remaining(c),
+                    "blockedBy": None if destructive_migrations_allowed() else "VERCEL_ENV=preview"})
+    return out
+
+
+def _auth_migrate(c):
+    """Idempotent upgrade of an existing database to the hardened auth schema.
+
+    Additive steps (tables, indexes, columns) always run — the code needs them.
+    The single destructive step is gated and recorded, see above.
+    """
+    c.executescript(_AUTH_DDL)
+    if "pw_changed_at" not in _table_cols(c, "users"):
+        c.execute("ALTER TABLE users ADD COLUMN pw_changed_at TEXT")
+    scols = _table_cols(c, "sessions")
+    if "expires_at" not in scols:
+        c.execute("ALTER TABLE sessions ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
+    if "user_agent" not in scols:
+        c.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT")
+    c.commit()
+    # --- destructive, one-time, security-critical ---
+    # Every token issued before this migration was stored in PLAINTEXT, and
+    # those tokens were committed to this repository inside
+    # backups/warroom-dump.sql: live logins for anyone who can read the repo.
+    # They are destroyed rather than migrated, so each user signs in once more.
+    if _migration_done(c, MIGRATION_LEGACY_SESSION_PURGE):
+        return
+    if not destructive_migrations_allowed():
+        return
+    n = legacy_sessions_remaining(c)
+    if n > 0:
+        c.execute("DELETE FROM sessions WHERE expires_at IS NULL OR expires_at=0")
+        c.commit()
+    _record_migration(c, MIGRATION_LEGACY_SESSION_PURGE,
+                      "destroyed %d plaintext-token session(s)" % max(n, 0))
 
 
 def _table_cols(c, table):
@@ -155,35 +245,19 @@ def _table_cols(c, table):
         return set()
 
 
-def _auth_migrate(c):
-    """Idempotent upgrade of an existing database to the hardened auth schema."""
-    c.executescript(_AUTH_DDL)
-    if "pw_changed_at" not in _table_cols(c, "users"):
-        c.execute("ALTER TABLE users ADD COLUMN pw_changed_at TEXT")
-    scols = _table_cols(c, "sessions")
-    if "expires_at" not in scols:
-        c.execute("ALTER TABLE sessions ADD COLUMN expires_at REAL NOT NULL DEFAULT 0")
-        # ONE-TIME, deliberate: every token issued before this migration was
-        # stored in PLAINTEXT, and those plaintext tokens were committed to
-        # this repository inside backups/warroom-dump.sql — i.e. they are live
-        # logins for anyone who can read the repo. They are destroyed instead
-        # of migrated, so each user signs in once more; from here on only
-        # SHA-256 digests are ever stored.
-        c.execute("DELETE FROM sessions")
-    if "user_agent" not in scols:
-        c.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT")
-    c.commit()
-
-
 def init_db():
     c = db()
     if dbwrap.CLOUD:
-        # Fast path: recovery_codes is the newest object, so its presence
-        # means this database has already been fully migrated.
+        # Fast path: both the newest table AND the record of the one destructive
+        # migration must be present. Checking only the table would let a Vercel
+        # preview (which shares this database but skips destructive steps) make
+        # production return early and never purge the leaked plaintext tokens.
         try:
             c.execute("SELECT 1 FROM recovery_codes LIMIT 1").fetchone()
-            c.close()
-            return
+            if c.execute("SELECT 1 FROM schema_migrations WHERE name=?",
+                         (MIGRATION_LEGACY_SESSION_PURGE,)).fetchone():
+                c.close()
+                return
         except Exception:
             pass
         have = {r[0] for r in c.execute(
@@ -916,6 +990,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                query_ms=int((t2 - t1) * 1000),
                                total_ms=int((t2 - t0) * 1000),
                                region=_os.environ.get("VERCEL_REGION", "local"))
+                    # Lets the admin confirm the one-way auth migration actually
+                    # ran on PRODUCTION (a preview deployment deliberately skips
+                    # it, so this is how you tell the two apart).
+                    try:
+                        pend = pending_migrations(hc)
+                        out["pendingMigrations"] = pend
+                        out["destructiveMigrationsAllowed"] = destructive_migrations_allowed()
+                        out["vercelEnv"] = _os.environ.get("VERCEL_ENV", "local")
+                    except Exception:
+                        pass
                 hc.close()
                 return self._send(out)
             except Exception:

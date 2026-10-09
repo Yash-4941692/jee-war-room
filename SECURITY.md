@@ -172,11 +172,25 @@ POST /api/admin/set-password       now enforces policy + revokes the target's se
 
 ## 6. Deploy notes
 
+* **Preview deployments share the production database.** Vercel env vars are set
+  for production *and* preview, and `api/index.py` runs `init_db()` at import —
+  so opening a PR executes migrations against live data on the preview's first
+  cold start. Destructive one-way steps are therefore gated on
+  `VERCEL_ENV != "preview"`, recorded in `schema_migrations`, and scoped to rows
+  only the pre-hardening code could have written (`sessions.expires_at = 0`) so
+  they are idempotent. `init_db()`'s fast path checks the migration record, so a
+  preview cannot make production *skip* the purge. See DEPLOY.md for the
+  permanent fix (a separate preview database).
 * **Schema migration is automatic and idempotent** (`server.init_db()` on cold
-  start). It creates `recovery_codes`, `auth_throttle`, `auth_events`, adds
-  `sessions.expires_at` / `sessions.user_agent` / `users.pw_changed_at`, and
-  clears the old plaintext sessions. Verified by `tools/selftest_migration.py`,
-  which builds a database in the exact old shape first.
+  start). It creates `recovery_codes`, `auth_throttle`, `auth_events`,
+  `schema_migrations`, adds `sessions.expires_at` / `sessions.user_agent` /
+  `users.pw_changed_at`, and clears the old plaintext sessions. Verified by
+  `tools/selftest_migration.py`, which builds a database in the exact old shape
+  first — including a preview-then-production sequence.
+* **Confirm the purge ran** on production after merging:
+  `curl -s "https://<host>/healthz?detail=1"` →
+  `pendingMigrations: []`, `destructiveMigrationsAllowed: true`,
+  `vercelEnv: "production"`.
 * **Every user signs in once more** after this deploy. Expected: their old
   tokens were in the committed dump.
 * **Announce the change** to your 13 users before deploying: password reset now

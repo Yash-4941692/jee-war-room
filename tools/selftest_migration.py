@@ -18,6 +18,10 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+import authsec  # noqa: E402
+import server   # noqa: E402
+
 DB = os.path.join(ROOT, "data", "warroom.db")
 # A legacy account's password, stored by the OLD signup exactly as typed —
 # spaces included. The hardening must keep this owner able to get in.
@@ -113,6 +117,70 @@ def build_old_db():
     c.close()
 
 
+def test_preview_gating():
+    """Vercel preview deployments share the production Turso database in this
+    project, so they must not run the one-way auth migration against live data
+    — but they must not cause production to SKIP it either."""
+    print("\n--- preview-deployment gating ---")
+    build_old_db()
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    legacy_before = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    c.close()
+
+    os.environ["VERCEL_ENV"] = "preview"
+    try:
+        server.init_db()
+        c = sqlite3.connect(DB)
+        c.row_factory = sqlite3.Row
+        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        scols = {r[1] for r in c.execute("PRAGMA table_info(sessions)")}
+        check("preview still applies ADDITIVE schema (code needs it)",
+              "recovery_codes" in tables and "expires_at" in scols, sorted(tables)[-4:])
+        n_after = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        check("preview does NOT destroy live sessions",
+              n_after == legacy_before, (n_after, legacy_before))
+        pend = server.pending_migrations(c)
+        check("preview reports the purge as still pending",
+              len(pend) == 1 and pend[0]["blockedBy"] == "VERCEL_ENV=preview", pend)
+        check("preview counts the legacy sessions awaiting purge",
+              pend and pend[0]["legacySessions"] == legacy_before, pend)
+        check("destructive_migrations_allowed() is False on preview",
+              server.destructive_migrations_allowed() is False)
+        c.close()
+
+        # Now the production deploy of the same code.
+        os.environ["VERCEL_ENV"] = "production"
+        server.init_db()
+        c = sqlite3.connect(DB)
+        c.row_factory = sqlite3.Row
+        check("production purges the legacy plaintext sessions",
+              c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0)
+        check("production records the migration",
+              server._migration_done(c, server.MIGRATION_LEGACY_SESSION_PURGE))
+        check("no migrations pending after production run",
+              server.pending_migrations(c) == [], server.pending_migrations(c))
+        check("destructive_migrations_allowed() is True on production",
+              server.destructive_migrations_allowed() is True)
+
+        # A session created by the hardened code must survive later runs —
+        # this is what makes the purge idempotent and prevents a second
+        # unexpected mass sign-out.
+        raw = server._make_session_row(c, 2, "post-migration-agent")
+        c.close()
+        server.init_db()
+        c = sqlite3.connect(DB)
+        c.row_factory = sqlite3.Row
+        rows = [r["token"] for r in c.execute("SELECT token FROM sessions")]
+        check("post-migration session survives a later init_db (no double sign-out)",
+              len(rows) == 1 and rows[0] == authsec.hash_token(raw), rows)
+        check("re-running init_db does not re-record or re-purge",
+              server.pending_migrations(c) == [])
+        c.close()
+    finally:
+        os.environ.pop("VERCEL_ENV", None)
+
+
 def main():
     print("Building a database in the OLD (pre-hardening) shape ...")
     build_old_db()
@@ -125,7 +193,6 @@ def main():
     print("  old db: %d users, %d plaintext sessions, %d activities, %d messages\n"
           % (n_users, n_sessions, n_act, n_msg))
 
-    import server
     t0 = time.time()
     server.init_db()
     print("init_db() ran in %.2fs\n" % (time.time() - t0))
@@ -157,7 +224,6 @@ def main():
           c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == n_users)
 
     # --- a freshly issued session must be stored only as a digest ---
-    import authsec
     raw = server._make_session_row(c, 2, "selftest-agent")
     stored = [r["token"] for r in c.execute("SELECT token FROM sessions")]
     check("new session token is NOT stored in plaintext", raw not in stored, stored)
@@ -206,6 +272,9 @@ def main():
     check("codes are unambiguous (no 0/O/1/I)",
           all(ch not in "0O1I" for code in codes for ch in code), codes[:2])
     c.close()
+
+    # Rebuilds the old-shape database again to exercise the preview gate.
+    test_preview_gating()
 
     print("\n%s" % ("MIGRATION + AT-REST CHECKS PASSED" if not fails
                     else "FAILURES: %s" % fails))
