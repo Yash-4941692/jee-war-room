@@ -15,6 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import dbwrap  # noqa: E402
 import server  # noqa: E402
 
 
@@ -29,6 +30,20 @@ def _ensure_db():
     retried lazily on every request until it succeeds.
     """
     if server.BOOT_INFO.get("ok"):
+        return
+    if not dbwrap.CLOUD and os.environ.get("VERCEL_ENV"):
+        # Running on Vercel with NO Turso URL for this environment: the app
+        # would fall back to the local sqlite file, which cannot exist on the
+        # read-only function filesystem. (This previously crashed the function
+        # at IMPORT time — every request died as a platform 500 before any
+        # JSON could be sent.) Report it loudly instead.
+        server.BOOT_INFO["ok"] = False
+        server.BOOT_INFO["error"] = (
+            "TURSO_DATABASE_URL is not set for this Vercel environment "
+            "(VERCEL_ENV=%s). Check Vercel → Settings → Environment "
+            "Variables: TURSO_DATABASE_URL/TURSO_AUTH_TOKEN must be scoped "
+            "to this environment (Production AND Preview share nothing "
+            "automatically)." % os.environ.get("VERCEL_ENV"))
         return
     try:
         server.init_db()

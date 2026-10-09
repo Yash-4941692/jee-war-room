@@ -24,6 +24,16 @@ Secrets: `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`,
 `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`
 Variables: `APP_URL`
 
+⚠️ `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` must be scoped to **every
+environment that needs a database** (Vercel → Settings → Environment
+Variables → Environments). Scoping them to Production only leaves Preview
+deployments with no database at all — previously that killed the function at
+import time (a platform 500, the bare "Request failed (500)" toast on every
+login attempt). The code now degrades instead: pages load, every API call
+answers a JSON 503, and `GET /healthz?detail=1` spells out the missing
+variable (`bootOk: false`, `bootError: "TURSO_DATABASE_URL is not set for
+this Vercel environment…"`).
+
 ## How the serverless port works
 
 - `server.Handler` is a stdlib `http.server.BaseHTTPRequestHandler`; Vercel's

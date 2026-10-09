@@ -24,7 +24,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
 if not (os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    except OSError:
+        pass  # read-only deploy bundles (Vercel): a missing Turso URL must not
+              # kill the function at IMPORT time — requests then degrade to a
+              # clean JSON 503 with a bootError at /healthz?detail=1 instead of
+              # a platform-level "Request failed (500)"
 
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
