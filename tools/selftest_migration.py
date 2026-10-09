@@ -8,8 +8,14 @@
    plaintext sessions are destroyed, and that nothing else is lost.
 3. Asserts that a token issued after the migration is stored ONLY as a digest.
 4. Asserts the legacy-whitespace self-heal path works.
+5. Regressions for the new-device "Request failed (500)" login bug:
+   (a) login succeeds and returns a token even when recovery-code issuance
+       raises (codes are best-effort; Settings can regenerate them);
+   (b) no request path can produce a non-JSON error body;
+   (c) a DB missing the hardened columns still serves /api/auth/login.
 """
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -181,6 +187,142 @@ def test_preview_gating():
         os.environ.pop("VERCEL_ENV", None)
 
 
+def _start_local_server():
+    """In-process HTTP server running the real Handler against data/warroom.db."""
+    import http.server
+    import socketserver
+    import threading
+
+    class _Srv(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = _Srv(("127.0.0.1", 0), server.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+def _http(port, method, path, body=None, cookie=None, token=None):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    headers = {}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    if cookie:
+        headers["Cookie"] = cookie
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    conn.request(method, path, body=data, headers=headers)
+    r = conn.getresponse()
+    raw = r.read().decode("utf-8", "replace")
+    conn.close()
+    return r.status, raw
+
+
+def _json(raw):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _broken_gen(n=8):
+    raise RuntimeError("simulated recovery-code issuance failure")
+
+
+def test_login_resilience():
+    """Regressions for the new-device 'Request failed (500)' login bug."""
+    print("\n--- login resilience (new-device 500 regressions) ---")
+
+    # ---- (b) + (c): serve the UNMIGRATED database, init_db() NOT run ----
+    # Every handler now runs the lazy bootstrap (_ensure_boot) before routing,
+    # so the first request self-heals the schema additively — the login must
+    # come back as JSON whatever happens, and on this throwaway DB it succeeds.
+    build_old_db()
+    srv, port = _start_local_server()
+    try:
+        st, raw = _http(port, "POST", "/api/auth/login",
+                        {"name": "Yash", "password": LEGACY_PW})
+        d = _json(raw)
+        check("(c) unmigrated DB serves /api/auth/login with a JSON body (HTTP %d)" % st,
+              d is not None, raw[:120])
+        check("(c) ... never a non-JSON platform error",
+              d is not None and (d.get("ok") or isinstance(d.get("error"), str)), d)
+        check("(c) lazy bootstrap self-heals the schema: login returns a token",
+              st == 200 and bool((d or {}).get("token")), d)
+        check("(c) that first login also issues the 8 recovery codes",
+              len((d or {}).get("recoveryCodes") or []) == 8,
+              sorted(d.keys()) if isinstance(d, dict) else raw[:80])
+
+        battery = [
+            ("GET", "/api/me", None, None, None),
+            ("GET", "/api/me", None, "jwr_sess=stale-cookie", None),
+            ("GET", "/api/me", None, "jwr_sess=leaked-token-0", None),
+            ("POST", "/api/auth/login", {"name": "Yash", "password": "wrong"}, None, None),
+            ("POST", "/api/me", {"name": "x"}, None, None),
+            ("POST", "/api/auth/reset-password",
+             {"name": "Yash", "recoveryCode": "ABCD-EFGH-JKMN",
+              "newPassword": "reset-pass-123"}, None, None),
+        ]
+        for (m, p, b, ck, tok) in battery:
+            st, raw = _http(port, m, p, b, cookie=ck, token=tok)
+            check("(b) %s %s -> JSON error body (HTTP %d)" % (m, p, st),
+                  _json(raw) is not None, raw[:100])
+        st, raw = _http(port, "PUT", "/api/me", {"name": "x"})
+        check("(b) unsupported method -> JSON error body (HTTP %d)" % st,
+              _json(raw) is not None, raw[:100])
+    finally:
+        srv.shutdown()
+
+    # ---- migrate, then (a): broken issuance must not sink the login ----
+    server.init_db()
+    srv, port = _start_local_server()
+    try:
+        # Codes were already issued by the first (self-healed) login above, so
+        # this is a REPEAT login: it must not hand out a second batch.
+        st, raw = _http(port, "POST", "/api/auth/login",
+                        {"name": "Yash", "password": LEGACY_PW})
+        d = _json(raw) or {}
+        check("repeat login succeeds and returns a token",
+              st == 200 and bool(d.get("token")), raw[:150])
+        check("repeat login does NOT re-issue recovery codes",
+              isinstance(d, dict) and "recoveryCodes" not in d,
+              sorted(d.keys()) if isinstance(d, dict) else raw[:80])
+
+        # Force re-issuance on the next login, then break issuance entirely.
+        c = sqlite3.connect(DB)
+        uid = c.execute("SELECT id FROM users WHERE name='Yash'").fetchone()[0]
+        c.execute("DELETE FROM recovery_codes WHERE user_id=?", (uid,))
+        c.commit()
+        c.close()
+        real_gen = authsec.gen_recovery_codes
+        authsec.gen_recovery_codes = _broken_gen
+        try:
+            st, raw = _http(port, "POST", "/api/auth/login",
+                            {"name": "Yash", "password": LEGACY_PW})
+        finally:
+            authsec.gen_recovery_codes = real_gen
+        d = _json(raw) or {}
+        check("(a) login SUCCEEDS even though recovery-code issuance raises",
+              st == 200 and bool(d.get("token")), raw[:150])
+        check("(a) broken issuance returns no recoveryCodes",
+              isinstance(d, dict) and "recoveryCodes" not in d,
+              sorted(d.keys()) if isinstance(d, dict) else raw[:80])
+        st, raw = _http(port, "GET", "/api/me", token=d.get("token"))
+        check("(a) the token from the degraded login authenticates", st == 200, raw[:100])
+        c = sqlite3.connect(DB)
+        c.row_factory = sqlite3.Row
+        kinds = [r["kind"] for r in
+                 c.execute("SELECT kind FROM auth_events ORDER BY id DESC LIMIT 8")]
+        c.close()
+        check("(a) the failed issuance is recorded in auth_events",
+              "recovery_codes_failed" in kinds, kinds)
+    finally:
+        srv.shutdown()
+
+
 def main():
     print("Building a database in the OLD (pre-hardening) shape ...")
     build_old_db()
@@ -275,6 +417,9 @@ def main():
 
     # Rebuilds the old-shape database again to exercise the preview gate.
     test_preview_gating()
+
+    # Rebuilds it once more to exercise the un-/half-migrated login paths.
+    test_login_resilience()
 
     print("\n%s" % ("MIGRATION + AT-REST CHECKS PASSED" if not fails
                     else "FAILURES: %s" % fails))

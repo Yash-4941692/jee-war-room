@@ -17,11 +17,25 @@ if ROOT not in sys.path:
 
 import server  # noqa: E402
 
-# Fast read schema verification on cold start (DDL only if tables missing)
-try:
-    server.init_db()
-except Exception as _e:
-    print("init_db warning:", _e)
+
+def _ensure_db():
+    """Run (or retry) the schema migration.
+
+    A failure here used to be swallowed by a bare `except: print(...)` at
+    import time, so a failed or half-applied migration on Turso still booted
+    the app and then every /api/* request 500'd with no operator-visible
+    cause. The boot state is recorded in server.BOOT_INFO (surfaced at
+    GET /healthz?detail=1 as bootOk / bootError) and retried lazily on every
+    request until it lands. The logic itself lives in server._ensure_boot():
+    Vercel's rewrite routing can send a request to the root `server` function
+    instead of this one, and whichever serves it must run the bootstrap.
+    """
+    server._ensure_boot()
+
+
+# Attempt the migration on cold start. Failure is reported, not swallowed —
+# and each following request retries it until it lands.
+_ensure_db()
 
 
 class handler(server.Handler):
@@ -37,8 +51,10 @@ class handler(server.Handler):
 
     def do_GET(self):
         self._restore_path()
+        _ensure_db()
         super().do_GET()
 
     def do_POST(self):
         self._restore_path()
+        _ensure_db()
         super().do_POST()

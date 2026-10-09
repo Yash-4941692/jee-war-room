@@ -130,6 +130,12 @@ password and take over the account. It was also:
   database, so nothing about the account is revealed.
 * Lost all your codes? The admin resets the password from Settings → Registered
   Users, or via the CLI.
+* **Issuance is best-effort.** Codes are a convenience, not a credential: if
+  writing them fails (e.g. a Turso blip mid-issuance), signup/login still
+  succeed and return the session token, and a `recovery_codes_failed` event is
+  recorded in the audit trail. The user simply generates a new set in
+  Settings → Account Security. A code write can never block a legitimate
+  sign-in.
 
 ---
 
@@ -139,7 +145,7 @@ password and take over the account. It was also:
 |---|---|---|
 | Brute force | none | DB-backed throttling, shared across serverless instances: **5 failures per username → 60 s, doubling to 1 h**; **30 per IP / 15 min → 15 min block**; 10 signups per IP per hour; 20 friend-code lookups per 10 min. `429` + `Retry-After`. |
 | User enumeration | distinct messages/statuses | one identical message and status for unknown-user and wrong-password; a dummy PBKDF2 run equalizes response **timing** |
-| Session lifetime | never expired, `Max-Age` 90 days | 30-day absolute expiry, `expires_at` enforced in `_auth()`, hourly purge |
+| Session lifetime | never expired, `Max-Age` 90 days | 30-day absolute expiry, `expires_at` enforced in `_auth()`, hourly purge in a background worker (never inline on the login path) |
 | Session revocation | *"existing sessions for that user stay valid"* | every password change/reset/admin-reset revokes all other sessions; `users.pw_changed_at` makes `_auth()` reject any session minted before it as a second line of defence |
 | "Log out everywhere" | absent | `POST /api/me/sessions/revoke-all` (keeps the calling device) |
 | Password policy | min 4 chars | min 8, max 128 (512 hard reject), blocklist of common passwords, cannot contain the username, cannot be a single repeated run, must differ from the current one |
@@ -166,7 +172,9 @@ GET  /api/admin/auth-events        admin-only audit trail
 POST /api/admin/set-password       now enforces policy + revokes the target's sessions
 ```
 
-`recoveryCodes` are only ever present in the response that created them.
+`recoveryCodes` are only ever present in the response that created them —
+when issuance succeeds; it is best-effort (see §3), so a response without them
+is not an error, and Settings → Account Security regenerates a fresh set.
 
 ---
 
@@ -186,11 +194,20 @@ POST /api/admin/set-password       now enforces policy + revokes the target's se
   `schema_migrations`, adds `sessions.expires_at` / `sessions.user_agent` /
   `users.pw_changed_at`, and clears the old plaintext sessions. Verified by
   `tools/selftest_migration.py`, which builds a database in the exact old shape
-  first — including a preview-then-production sequence.
+  first — including a preview-then-production sequence. A failed `init_db()`
+  is no longer swallowed: `api/index.py` records it in `server.BOOT_INFO`,
+  retries lazily on every request, and reports it at `/healthz?detail=1`
+  (`bootOk` / `bootError`).
+* **Half-migrated databases degrade, they don't deny.** `_auth()` and
+  `recovery_status()` detect missing columns/tables once (cached) and fall
+  back to the pre-hardening query shape instead of 500-ing on every request.
+  A *transient* DB failure still surfaces as a 500 — deliberately: turning it
+  into a 401 would make the frontend drop its stored token and silently sign
+  out every user on a passing blip.
 * **Confirm the purge ran** on production after merging:
   `curl -s "https://<host>/healthz?detail=1"` →
-  `pendingMigrations: []`, `destructiveMigrationsAllowed: true`,
-  `vercelEnv: "production"`.
+  `bootOk: true`, `pendingMigrations: []`,
+  `destructiveMigrationsAllowed: true`, `vercelEnv: "production"`.
 * **Every user signs in once more** after this deploy. Expected: their old
   tokens were in the committed dump.
 * **Announce the change** to your 13 users before deploying: password reset now
@@ -207,9 +224,23 @@ POST /api/admin/set-password       now enforces policy + revokes the target's se
 
 ```bash
 python3 server.py &                     # local sqlite on :8080
-python3 tools/selftest_auth.py          # 51 HTTP-level checks
+python3 tools/selftest_auth.py          # 58 HTTP-level checks
 python3 tools/selftest_migration.py     # old-schema migration + at-rest checks
+                                        # + login-resilience regressions:
+                                        #   (a) login survives broken code issuance
+                                        #   (b) no path answers a non-JSON error
+                                        #   (c) an unmigrated DB still serves login
+python3 tools/diag_login_roundtrips.py  # login round-trip budget (<=8 / <=5)
+python3 tools/repro_login_500.py        # un-/half-migrated DB must answer JSON
 ```
+
+Also enforced here: the **login round-trip budget** — every statement on the
+auth path is a Turso HTTPS round trip inside a 7 s watchdog under a 30 s
+function budget, so a new-device login costs <= 8 statements and a repeat
+login <= 5 (batched multi-row writes, single `key IN (…)` throttle queries,
+housekeeping in a background worker). Exceeding it is what produced the
+platform 500 behind the bare "Request failed (500)" login toast. See
+STATUS.md and DEPLOY.md.
 
 `selftest_auth.py` proves the properties that matter: the friend code cannot
 reset a password, recovery codes work once and cannot be replayed, failures are
