@@ -9,3 +9,8 @@ deploy/*
 !deploy/HF_README.md
 .vercel
 .vercel/
+
+# Database dumps are never committed: even a "redacted" dump belongs outside
+# git history, and a full one contains password hashes and live session tokens.
+backups/
+*.sql

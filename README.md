@@ -24,12 +24,26 @@ The same code then uses the cloud libSQL database instead of the local file.
 See [DEPLOY.md](DEPLOY.md) for the free permanent deployment
 (GitHub + Koyeb + Turso + GitHub Actions keep-alive/backups).
 
+## Security
+
+Passwords are one-way PBKDF2 hashes and can never be read back — not by the
+admin, not from a backup. Account recovery uses **one-time recovery codes**;
+the friend code links buddies and is deliberately *not* a credential.
+Read [SECURITY.md](SECURITY.md) for the model, the incident that prompted the
+hardening, and the admin to-do list.
+
+    python3 tools/account_recovery.py --help    # recover/verify/reset an account
+    python3 tools/selftest_auth.py              # 51 auth security checks
+    python3 tools/selftest_migration.py         # old-schema migration checks
+
 ## Layout
 
 - `server.py` — HTTP API + business logic
+- `authsec.py` — password/session/recovery-code/throttling primitives
 - `dbwrap.py` — database adapter (local sqlite3 / cloud libSQL)
 - `syllabus.py` — 61 PCM chapters
-- `static/` — single-page frontend (index.html, app.js, styles.css)
-- `tools/turso_io.py` — cloud migration and SQL dump tooling
+- `public/` — single-page frontend (index.html, app.js, styles.css)
+- `tools/turso_io.py` — cloud migration and SQL dump tooling (dumps are redacted
+  by default; `--full` refuses to write inside the repo)
 - `guardian.sh` / `supervise.sh` — interim sandbox keep-alive scripts
   (not used once the app is hosted on Koyeb)

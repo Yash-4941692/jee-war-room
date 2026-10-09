@@ -14,6 +14,13 @@
 - **v8 performance work:** libsql client is cached per warm worker (no TLS
   handshake per request) with auto-reconnect; signup/reset insert 61 chapters
   in ONE batched multi-row INSERT (signup 22-30 s on US → ~0.6 s in Mumbai).
+- **Auth hardening (see SECURITY.md):** one-time recovery codes replace the
+  friend code for password reset; session tokens stored only as SHA-256 digests
+  with a 30-day expiry; DB-backed throttling on login/signup/reset; identical
+  errors for unknown-user and wrong-password; password changes revoke other
+  sessions; CSRF origin check on cookie-authenticated POSTs; CSP + nosniff +
+  Referrer-Policy headers; auth_events audit trail (admin-only);
+  `tools/selftest_auth.py` (51 checks) and `tools/selftest_migration.py`.
 - **v8 features:** admin-only 📢 Announce composer + per-user unread banner on
   Home/Today (`announcements` table; read state in settings.seenAnnouncements);
   admin 👥 Registered Users panel with password RESET (passwords are PBKDF2
@@ -27,8 +34,11 @@
   all paths with ?__path so routing is unchanged.
 - Automations (verified 2026-09-16):
   - `.github/workflows/keepalive.yml` — pings /healthz twice an hour
-  - `.github/workflows/db-backup.yml` — weekly Turso SQL dump committed to repo
-    (`backups/warroom-dump.sql`), secrets TURSO_* in GitHub
+  - `.github/workflows/db-backup.yml` — weekly Turso SQL dump uploaded as
+    PRIVATE, EXPIRING workflow artifacts (redacted 90 d / full 30 d). It no
+    longer commits anything to the repo: the old committed dump leaked password
+    hashes, friend codes and live session tokens (see SECURITY.md §2).
+    secrets TURSO_* in GitHub
   - `.github/workflows/deploy-vercel.yml` — MANUAL fallback only (CLI deploys
     from Actions stall; native Vercel Git connect is the recommended toggle:
     Vercel project → Settings → Git → connect Yash-4941692/jee-war-room, branch main)
@@ -65,13 +75,26 @@
 
 ## Accounts / data
 
-- id 2 Yash (admin ALYWAY), id 3 Anshkumar (KQ8PIB), plus Yash-invited users
-  id 4 shubh (KFYJRY), id 5 chiken (4N8AWV), id 6 Khimesh Patel (7L7YC5),
-  id 7 Aman (I1Y8AB). Friendships: Yash↔shubh, Yash↔Khimesh, Yash↔Aman; chats live.
+- id 2 Yash (admin), id 3 Anshkumar, plus Yash-invited users id 4 shubh,
+  id 5 chiken, id 6 Khimesh Patel, id 7 Aman. Friendships: Yash↔shubh,
+  Yash↔Khimesh, Yash↔Aman; chats live.
+  Friend codes are deliberately NOT listed here any more — they used to be
+  treated as semi-public identifiers and the old reset endpoint accepted one as
+  proof of identity. They are still visible to the admin in-app
+  (Settings → Registered Users) and via `tools/account_recovery.py list`.
 - Live credentials/tokens live OUTSIDE the repo in
   /home/user/secrets/jee-war-room/ (vercel-token, turso tokens, ngrok.yml).
-- Password reset for users is available in-app via the admin Users panel
-  (POST /api/admin/set-password); passwords themselves can never be retrieved.
+- Passwords can NEVER be retrieved (PBKDF2-HMAC-SHA256, 120k iterations,
+  per-user salt). Recovery paths, in order:
+    1. the user's own one-time recovery codes (POST /api/auth/reset-password);
+    2. the admin Users panel in-app (POST /api/admin/set-password);
+    3. `tools/account_recovery.py` on a machine with the TURSO_* env vars
+       (`verify` tests a remembered password locally, `set-password` replaces it,
+       `codes` issues fresh recovery codes, `revoke --all` signs everyone out).
+- Self-service reset no longer accepts a friend code — see SECURITY.md.
+- After the auth-hardening deploy every user signs in once more (all pre-existing
+  session tokens were destroyed because they had leaked into the committed dump)
+  and receives 8 recovery codes on first login.
 
 ## Legacy interim stack (sandbox, best-effort — no longer primary)
 
