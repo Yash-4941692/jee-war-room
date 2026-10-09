@@ -282,6 +282,43 @@ def _missing_schema(e):
 BOOT_INFO = {"ok": None, "error": None}
 
 
+def _ensure_boot():
+    """Lazy init_db() with a recorded outcome — safe to call on every request.
+
+    The boot logic must live HERE (not only in api/index.py): Vercel's
+    rewrite routing can hand a request to the root `server` function instead
+    of `api/index`, and whichever one serves the request must guarantee the
+    schema migration was attempted. The outcome is visible at
+    /healthz?detail=1 (bootOk / bootError).
+    """
+    if BOOT_INFO.get("ok"):
+        return
+    import dbwrap as _dbwrap
+    if not _dbwrap.CLOUD and os.environ.get("VERCEL_ENV"):
+        # Running on Vercel with NO Turso URL for this environment: the app
+        # would fall back to the local sqlite file, which cannot exist on the
+        # read-only function filesystem. Report it loudly instead of dying.
+        BOOT_INFO["ok"] = False
+        BOOT_INFO["error"] = (
+            "TURSO_DATABASE_URL is not set for this Vercel environment "
+            "(VERCEL_ENV=%s). Check Vercel → Settings → Environment "
+            "Variables: TURSO_DATABASE_URL/TURSO_AUTH_TOKEN must be scoped "
+            "to this environment." % os.environ.get("VERCEL_ENV"))
+        return
+    try:
+        init_db()
+    except Exception as e:
+        BOOT_INFO["ok"] = False
+        BOOT_INFO["error"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+        try:
+            print("init_db failed (retrying on next request):", BOOT_INFO["error"])
+        except Exception:
+            pass
+        return
+    BOOT_INFO["ok"] = True
+    BOOT_INFO["error"] = None
+
+
 def init_db():
     c = db()
     if dbwrap.CLOUD:
@@ -1100,6 +1137,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._restore_vercel_path()
+        # Lazy migration bootstrap: Vercel may route the request to this root
+        # module's function instead of api/index, so boot cannot live there
+        # alone. Cheap no-op once the boot has succeeded on this worker.
+        _ensure_boot()
         u = urlparse(self.path); p = u.path; q = parse_qs(u.query)
         if p == "/healthz":
             # Boot/config state is reported even when the DB is down — that is
@@ -1180,6 +1221,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._restore_vercel_path()
+        _ensure_boot()   # see do_GET: the bootstrap must run whichever function
         u = urlparse(self.path); p = u.path
         if p.startswith("/api/"):
             # _csrf_ok()/_auth() are INSIDE the try: an exception escaping the

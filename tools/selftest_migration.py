@@ -237,6 +237,9 @@ def test_login_resilience():
     print("\n--- login resilience (new-device 500 regressions) ---")
 
     # ---- (b) + (c): serve the UNMIGRATED database, init_db() NOT run ----
+    # Every handler now runs the lazy bootstrap (_ensure_boot) before routing,
+    # so the first request self-heals the schema additively — the login must
+    # come back as JSON whatever happens, and on this throwaway DB it succeeds.
     build_old_db()
     srv, port = _start_local_server()
     try:
@@ -245,8 +248,13 @@ def test_login_resilience():
         d = _json(raw)
         check("(c) unmigrated DB serves /api/auth/login with a JSON body (HTTP %d)" % st,
               d is not None, raw[:120])
-        check("(c) ... and the failure carries an `error` field (degrade, never hang)",
+        check("(c) ... never a non-JSON platform error",
               d is not None and (d.get("ok") or isinstance(d.get("error"), str)), d)
+        check("(c) lazy bootstrap self-heals the schema: login returns a token",
+              st == 200 and bool((d or {}).get("token")), d)
+        check("(c) that first login also issues the 8 recovery codes",
+              len((d or {}).get("recoveryCodes") or []) == 8,
+              sorted(d.keys()) if isinstance(d, dict) else raw[:80])
 
         battery = [
             ("GET", "/api/me", None, None, None),
@@ -272,13 +280,16 @@ def test_login_resilience():
     server.init_db()
     srv, port = _start_local_server()
     try:
+        # Codes were already issued by the first (self-healed) login above, so
+        # this is a REPEAT login: it must not hand out a second batch.
         st, raw = _http(port, "POST", "/api/auth/login",
                         {"name": "Yash", "password": LEGACY_PW})
         d = _json(raw) or {}
-        check("post-migration login succeeds and returns a token",
+        check("repeat login succeeds and returns a token",
               st == 200 and bool(d.get("token")), raw[:150])
-        check("post-migration first login returns 8 recovery codes",
-              len(d.get("recoveryCodes") or []) == 8, sorted(d.keys()) if d else raw[:80])
+        check("repeat login does NOT re-issue recovery codes",
+              isinstance(d, dict) and "recoveryCodes" not in d,
+              sorted(d.keys()) if isinstance(d, dict) else raw[:80])
 
         # Force re-issuance on the next login, then break issuance entirely.
         c = sqlite3.connect(DB)

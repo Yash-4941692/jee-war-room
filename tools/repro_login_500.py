@@ -6,12 +6,18 @@ Builds a database in the OLD (pre-hardening) shape — exactly the state the
 Turso database is in when a migration failed or never ran — then serves it
 WITHOUT running init_db() and hammers the auth endpoints.
 
-Invariant asserted here: every /api/* response is a JSON body, and every
-failure carries an `error` field — on ANY status code. Before the fix,
-exceptions raised outside the handler try/except escaped
+Invariant asserted here: every /api/* response is a JSON body — failures
+carry an `error` field on ANY status code, and successes carry `ok`. Before
+the fix, exceptions raised outside the handler try/except escaped
 BaseHTTPRequestHandler entirely (no response sent, socket closed) and the
 Vercel proxy answered with a non-JSON 500; api() in public/app.js then fell
 back to the bare "Request failed (500)" toast and the login never completed.
+
+Note: every handler now runs the lazy bootstrap (_ensure_boot) before
+routing, so the FIRST request against the unmigrated DB self-heals the
+schema additively and the login succeeds outright — strictly better than the
+original acceptance bar of "a JSON error body". Both outcomes pass here; a
+non-JSON body never does.
 
 Uses the throwaway local database data/warroom.db (gitignored) and rebuilds
 it from scratch.

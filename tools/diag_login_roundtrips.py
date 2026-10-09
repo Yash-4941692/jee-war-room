@@ -138,6 +138,18 @@ def do_login(port, name, pw):
         return r.status, {"raw": raw}
 
 
+def get_json(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    conn.request("GET", path)
+    r = conn.getresponse()
+    raw = r.read().decode("utf-8", "replace")
+    conn.close()
+    try:
+        return r.status, json.loads(raw)
+    except Exception:
+        return r.status, {"raw": raw}
+
+
 def request_statements():
     """Statements issued by request-handling threads (not the background
     housekeeping worker — that one is off the user-facing path by design)."""
@@ -167,6 +179,11 @@ def main():
     dbwrap.db = counting_db
     fails = []
     try:
+        # Warm up the ONE-TIME lazy bootstrap (init_db on the first request):
+        # it is a per-worker startup cost, not part of the login path itself.
+        st, d = get_json(port, "/healthz")
+        assert st == 200 and d.get("ok"), "warm-up /healthz failed: %s %s" % (st, d)
+
         # ---------------- first new-device login ----------------
         COUNTING[0] = True
         del STATEMENTS[:]

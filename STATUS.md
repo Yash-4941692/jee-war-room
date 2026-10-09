@@ -48,10 +48,13 @@
     they DEGRADE to the pre-hardening query shape (cached detection) instead
     of 500-ing — and a transient DB failure must stay a 500, never a 401
     (app.js clears the token on 401 and would silently sign everyone out).
-  * `api/index.py` no longer swallows `init_db()` failures: the migration is
-    retried lazily on every request and the outcome is reported at
-    `/healthz?detail=1` as `bootOk` / `bootError` (also on the 503 path, so a
-    dead DB cannot hide the boot state).
+  * `init_db()` failures are no longer swallowed: the migration is retried
+    lazily and the outcome is reported at `/healthz?detail=1` as `bootOk` /
+    `bootError` (also on the 503 path, so a dead DB cannot hide the boot
+    state). The lazy bootstrap lives in `server._ensure_boot()` and runs at
+    the top of EVERY do_GET/do_POST, because Vercel's rewrite routing may
+    hand a request to the root `server` function instead of `api/index` —
+    whichever one serves the request must guarantee the schema was checked.
   * dbwrap NEVER reuses a client it has closed: the old `_reconnect()` handed
     the just-closed libsql client back out, and the next statement panicked
     inside the Rust binding (`PanicException` is a `BaseException`, so it
