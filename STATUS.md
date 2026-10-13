@@ -63,6 +63,33 @@
     `RuntimeError`s and poisoned clients replaced. Cloud `executescript`
     strips `--` comments before splitting (a `;` inside the recovery_codes
     comment used to break the DDL with "incomplete input").
+- **First-load budget (HARD CONSTRAINT, 2026-10-13):** the whole first screen
+  (me + friends + announcements + chapters) is ONE request —
+  `GET /api/bootstrap` — at **<= 30 SQL statements**; `GET /api/me` <= 12 and
+  `GET /api/friends` <= 20, and the buddy list must NOT grow with the buddy
+  count (verified by `tools/diag_boot_roundtrips.py`, which also proves the
+  bootstrap payloads are byte-identical to the per-endpoint payloads and that
+  the batched buddy list matches the old per-buddy code it replaced).
+  Before: 4 parallel function invocations, `/api/me` 21 statements,
+  `/api/friends` ~16 statements *per buddy* (164 with 10 buddies ≈ 4 s of
+  Turso round trips on a warm connection). Now: 26 statements in one request.
+  Rules that keep it there: `_begin_request()` resets a per-request memo
+  (`app_settings` read once instead of once per buddy), `ensure_snapshots()`
+  runs at most once per request, the buddy list uses `WHERE user_id IN (…)`
+  bulk queries + one `streak_rows()` query for everyone, and counters are
+  merged into `UNION ALL` statements. Serve with `/api/bootstrap` on the first
+  load in the client (`loadBootstrap()`), with the old four-call fan-out as a
+  fallback for a server that predates the endpoint (mid-deploy).
+- **Assets/edge (2026-10-13):** `?v=N` versioned URLs are `immutable` for a
+  year — **bump `?v=` in public/index.html and public/tour.html whenever
+  styles.css/app.js change** (currently v24); HTML is `no-cache` + weak ETag
+  (304s, bfcache) instead of `no-store`; the Docker/HF-Spaces path gzips text
+  assets (app.js 145 KB → ~42 KB) and stops re-sending them on every visit.
+  vercel.json mirrors the same Cache-Control rules for the edge-cached copies.
+  Vercel Web Analytics is now the platform's own same-origin
+  `/_vercel/insights/script.js` (deferred): the previous esm.sh ES-module
+  import cost every first load a third-party DNS + TLS + module fetch and was
+  blocked outright by the self-hosted CSP.
 - **v8 features:** admin-only 📢 Announce composer + per-user unread banner on
   Home/Today (`announcements` table; read state in settings.seenAnnouncements);
   admin 👥 Registered Users panel with password RESET (passwords are PBKDF2

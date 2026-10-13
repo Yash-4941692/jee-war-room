@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0a0d13">
 <title>JEE WAR ROOM — Official Explainer Video Tour</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
-<link rel="stylesheet" href="/styles.css?v=23">
+<link rel="stylesheet" href="/styles.css?v=24">
 <style>
 /* ============ TOUR PLAYER STYLES ============ */
 body {
@@ -1268,11 +1268,10 @@ const Tour = (() => {
 })();
 </script>
 
-<!-- Vercel Web Analytics using @vercel/analytics package -->
-<script type="module">
-  import { inject } from 'https://esm.sh/@vercel/analytics@2.0.1';
-  inject();
-</script>
+<!-- Vercel Web Analytics — the platform's own same-origin script (deferred),
+     instead of the previous esm.sh module import (third-party DNS + TLS on
+     every load, and blocked by the self-hosted CSP). -->
+<script defer src="/_vercel/insights/script.js"></script>
 </body>
 </html>
 

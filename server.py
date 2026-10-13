@@ -404,6 +404,29 @@ def are_friends(c, a, b):
 # ---------------------------------------------------------------- helpers
 def rowdict(r): return dict(r) if r else None
 
+# ------------------------------------------------------- request-scoped memo
+# On Vercel + Turso EVERY SQL statement is its own HTTPS round trip (see
+# DEPLOY.md → round-trip budget), so reading the same row twice inside ONE
+# request is pure latency. This thread-local memo lives for exactly one request
+# (Handler._begin_request() resets it on every do_GET/do_POST) and collapses the
+# repeat reads on the boot path: app_settings (global rulebook) used to be read
+# once per get_settings() call — i.e. once per buddy in /api/friends — and
+# ensure_snapshots() ran twice inside a single /api/me.
+_REQ = threading.local()
+
+
+def _req_memo():
+    d = getattr(_REQ, "memo", None)
+    if d is None:
+        d = _REQ.memo = {}
+    return d
+
+
+def _begin_request():
+    """Start a fresh memo. Called at the top of every request, so nothing a
+    previous request cached (or a background thread cached) can leak in."""
+    _REQ.memo = {}
+
 def default_settings():
     import copy
     return {
@@ -426,6 +449,9 @@ def default_settings():
 GLOBAL_KEYS = ("xp", "weights", "streakThreshold", "airEMA")
 
 def admin_settings(c):
+    memo = _req_memo()
+    if "admin_settings" in memo:
+        return memo["admin_settings"]
     d = default_settings()
     g = {"xp": dict(d["xp"]), "weights": dict(d["weights"]),
          "streakThreshold": d["streakThreshold"], "airEMA": d["airEMA"],
@@ -441,30 +467,47 @@ def admin_settings(c):
             g["activitiesEnabled"].update(saved["activitiesEnabled"])
     g["airEMA"] = clamp(float(g["airEMA"]), 0.5, 0.97)
     g["streakThreshold"] = clamp(int(g["streakThreshold"]), 10, 100)
+    memo["admin_settings"] = g
     return g
 
 def save_admin_settings(c, g):
     c.execute("INSERT INTO app_settings(id,json) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET json=excluded.json",
               (json.dumps(g),)); c.commit()
+    # The memo holds what the row USED to say; drop it so anything later in this
+    # same request re-reads the freshly written value instead of a stale one.
+    _req_memo().pop("admin_settings", None)
 
-def get_settings(c, uid):
-    r = c.execute("SELECT json FROM settings WHERE user_id=?", (uid,)).fetchone()
-    if r:
-        s = json.loads(r["json"])
-    else:
-        s = default_settings()
-    # fill any newly introduced defaults
-    d = default_settings()
-    for k, v in d.items():
+def _settings_with_defaults(saved):
+    """Shape + default-fill a settings JSON blob (no DB access).
+
+    Split out of get_settings() so a BULK caller can reuse one settings row per
+    user without paying a round trip per key — see friend_views_bulk().
+    """
+    s = saved if isinstance(saved, dict) else default_settings()
+    for k, v in default_settings().items():
         s.setdefault(k, v)
-    # admin/global rulebook overrides for everyone
-    g = admin_settings(c)
+    return s
+
+
+def apply_admin_settings(s, g):
+    """Overlay the admin's global rulebook onto one user's settings."""
     s["xp"] = dict(g["xp"]); s["weights"] = dict(g["weights"])
     s["streakThreshold"] = g["streakThreshold"]; s["airEMA"] = g["airEMA"]
     for a in s["activities"]:
         if a["key"] in g["activitiesEnabled"]:
             a["enabled"] = bool(g["activitiesEnabled"][a["key"]])
     return s
+
+
+def get_settings(c, uid):
+    r = c.execute("SELECT json FROM settings WHERE user_id=?", (uid,)).fetchone()
+    try:
+        saved = json.loads(r["json"]) if r else None
+    except Exception:
+        saved = None
+    s = _settings_with_defaults(saved)
+    # admin/global rulebook overrides for everyone
+    return apply_admin_settings(s, admin_settings(c))
 
 def save_settings(c, uid, s):
     c.execute("INSERT INTO settings(user_id,json) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET json=excluded.json",
@@ -712,17 +755,32 @@ def raw_score(c, uid, d, s):
 def air_for(score):
     return clamp(int(round(600000 * math.exp(-0.064 * score))), 1, 600000)
 
-def ensure_snapshots(c, uid, s, force_today=False):
-    """Backfill deterministic daily score/AIR snapshots up to today."""
-    u = c.execute("SELECT created_at FROM users WHERE id=?", (uid,)).fetchone()
-    if not u: return
-    first = date.fromisoformat(u["created_at"][:10])
+def ensure_snapshots(c, uid, s, force_today=False, created_at=None):
+    """Backfill deterministic daily score/AIR snapshots up to today.
+
+    Runs at most ONCE per request unless force_today is set: /api/me needs the
+    snapshots and so does _air(), and the second call used to re-issue the same
+    users + MAX(day) reads (2 extra Turso round trips on every first load).
+    Callers that already hold the user row pass created_at to skip its read.
+    """
+    memo = _req_memo()
+    key = ("snapshots", uid)
+    if not force_today and memo.get(key):
+        return
+    if created_at is None:
+        u = c.execute("SELECT created_at FROM users WHERE id=?", (uid,)).fetchone()
+        if not u:
+            memo[key] = True
+            return
+        created_at = u["created_at"]
+    first = date.fromisoformat(created_at[:10])
     today_d = datetime.now(IST).date()
     last = c.execute("SELECT MAX(day) d FROM snapshots WHERE user_id=?", (uid,)).fetchone()["d"]
     prev_score = 0.0
     if last:
         if last == DAY_F(today_d):
             if not force_today:
+                memo[key] = True
                 return
             y = c.execute("SELECT score FROM snapshots WHERE user_id=? AND day=?",
                           (uid, DAY_F(today_d - timedelta(days=1)))).fetchone()
@@ -750,6 +808,8 @@ def ensure_snapshots(c, uid, s, force_today=False):
         wrote = True
     if wrote:
         c.commit()
+    if not force_today:
+        memo[key] = True
 
 def level_info(xp):
     L = 1
@@ -766,45 +826,54 @@ def level_info(xp):
 def xp_total(c, uid):
     return c.execute("SELECT COALESCE(SUM(amount),0) v FROM xp_events WHERE user_id=?", (uid,)).fetchone()["v"]
 
-def streak_info(c, uid, s):
-    """Consecutive active study days (ending today or yesterday).
-    A day counts towards streak if the student logged study activities,
-    focus sessions, mocks, or completed targets."""
+def streak_rows(c, uids, since):
+    """ONE round trip for the streak inputs of N users.
+
+    Used to be three separate SELECTs per user (activities, mocks, targets),
+    which on the shared buddy payload meant 3 statements × every friend.
+    """
+    uids = list(uids)
+    ph = ",".join("?" * len(uids))
+    rows = c.execute("""
+        SELECT user_id, day, NULL AS status, COUNT(*) n FROM activities
+          WHERE user_id IN (%s) AND day>=? AND type!='distraction' GROUP BY user_id, day
+        UNION ALL
+        SELECT user_id, day, NULL, COUNT(*) FROM mocks
+          WHERE user_id IN (%s) AND day>=? GROUP BY user_id, day
+        UNION ALL
+        SELECT user_id, day, status, COUNT(*) FROM targets
+          WHERE user_id IN (%s) AND day>=? GROUP BY user_id, day, status
+    """ % (ph, ph, ph), tuple(uids) + (since,) + tuple(uids) + (since,) + tuple(uids) + (since,)).fetchall()
+    out = defaultdict(list)
+    for r in rows:
+        out[r["user_id"]].append(r)
+    return out
+
+
+def streak_from_rows(rows, s, today_dt=None):
+    """Consecutive active study days (ending today or yesterday) from
+    streak_rows() output. A day counts if the student logged study activities,
+    focus sessions, mocks, or completed enough targets."""
     thr = s.get("streakThreshold", 70) / 100.0
-    since = DAY_F(datetime.now(IST).date() - timedelta(days=120))
-    # 1. Days with study activities (lectures, revision, pyqs, dpp, homework, study)
-    rows_act = c.execute("""
-        SELECT DISTINCT day FROM activities 
-        WHERE user_id=? AND day>=? AND type!='distraction'
-    """, (uid, since)).fetchall()
-    active_days = {r["day"] if hasattr(r, "keys") else r[0] for r in rows_act}
-
-    # 2. Days with mock tests
-    rows_mock = c.execute("SELECT DISTINCT day FROM mocks WHERE user_id=? AND day>=?", (uid, since)).fetchall()
-    active_days |= {r["day"] if hasattr(r, "keys") else r[0] for r in rows_mock}
-
-    # 3. Days with targets completed (status done/partial, or meeting streakThreshold)
-    rows_tar = c.execute("""
-        SELECT day, status FROM targets 
-        WHERE user_id=? AND day>=? ORDER BY day DESC LIMIT 400
-    """, (uid, since)).fetchall()
+    active_days = set()
     t_days = defaultdict(lambda: [0, 0.0])
-    for r in rows_tar:
-        day = r["day"] if hasattr(r, "keys") else r[0]
-        st = r["status"] if hasattr(r, "keys") else r[1]
-        t_days[day][0] += 1
+    for r in rows:
+        day = r["day"]; st = r["status"]; n = r["n"]
+        if st is None:
+            active_days.add(day)          # an activity or a mock that day
+            continue
+        t_days[day][0] += n
         if st == "done":
-            t_days[day][1] += 1
+            t_days[day][1] += n
             active_days.add(day)
         elif st == "partial":
-            t_days[day][1] += 0.5
+            t_days[day][1] += 0.5 * n
             active_days.add(day)
-
     for day, (tot, done) in t_days.items():
         if tot > 0 and (done / tot) >= thr:
             active_days.add(day)
 
-    today_dt = datetime.now(IST).date()
+    today_dt = today_dt or datetime.now(IST).date()
     today_str = DAY_F(today_dt)
     yest_str = DAY_F(today_dt - timedelta(days=1))
 
@@ -824,6 +893,11 @@ def streak_info(c, uid, s):
     if best != s.get("bestStreak", 0):
         s["bestStreak"] = best
     return {"current": streak, "best": best}
+
+
+def streak_info(c, uid, s):
+    since = DAY_F(datetime.now(IST).date() - timedelta(days=120))
+    return streak_from_rows(streak_rows(c, [uid], since).get(uid, []), s)
 
 def sweep_targets(c, uid, s):
     """Once per day: mark leftover old open targets as missed, apply XP penalty."""
@@ -858,26 +932,41 @@ def touch_chapter(c, uid, subject, chapter):
         c.execute("UPDATE chapters SET status='in_progress' WHERE user_id=? AND subject=? AND name=? AND status='not_started'",
                   (uid, subject, chapter))
 
-def today_summary(c, uid, s):
-    t = TODAY()
+def merge_today_summary(act_rows, tgt_rows, mocks_n, errs_n):
+    """Pure assembly of today_summary()'s payload.
+
+    Split out so the buddy list can compute the same numbers for MANY users
+    from a few grouped queries instead of 4 round trips per buddy.
+    """
     day_min = 0; q = 0; distract = 0; custom = {}
-    for r in c.execute("SELECT type,custom_key,SUM(amount) am,SUM(duration) dm,COUNT(*) n FROM activities WHERE user_id=? AND day=? GROUP BY type,custom_key", (uid, t)):
+    for r in act_rows:
         tp = r["type"]; am = r["am"] or 0; dm = r["dm"] or 0; n = r["n"]
         if tp in ("study", "revision"): day_min += dm
         if tp in ("pyq", "dpp", "homework"): q += am
         if tp == "distraction": distract += dm
         if tp == "metric" or r["custom_key"]:
             custom[r["custom_key"] or ("__" + tp)] = {"amount": am, "duration": dm, "logs": n}
-    tr = c.execute("SELECT status, COUNT(*) n FROM targets WHERE user_id=? AND day=? GROUP BY status", (uid, t)).fetchall()
-    tm = {r["status"]: r["n"] for r in tr}
+    tm = {r["status"]: r["n"] for r in tgt_rows}
     planned = sum(tm.values()); done = tm.get("done", 0) + 0.5 * tm.get("partial", 0)
     exe = round(100 * done / planned) if planned else 0
-    mocks_n = c.execute("SELECT COUNT(*) n FROM mocks WHERE user_id=? AND day=?", (uid, t)).fetchone()["n"]
-    errs_n = c.execute("SELECT COUNT(*) n FROM errors WHERE user_id=? AND day=?", (uid, t)).fetchone()["n"]
     return {"minutes": day_min, "questions": q, "distractionMin": distract,
             "planned": planned, "done": tm.get("done", 0), "partial": tm.get("partial", 0),
             "missed": tm.get("missed", 0), "execution": exe, "mocks": mocks_n, "errors": errs_n,
             "custom": custom}
+
+
+def today_summary(c, uid, s):
+    t = TODAY()
+    act_rows = c.execute("SELECT type,custom_key,SUM(amount) am,SUM(duration) dm,COUNT(*) n "
+                         "FROM activities WHERE user_id=? AND day=? GROUP BY type,custom_key", (uid, t)).fetchall()
+    tgt_rows = c.execute("SELECT status, COUNT(*) n FROM targets WHERE user_id=? AND day=? GROUP BY status", (uid, t)).fetchall()
+    # One round trip for both counters (they used to be two separate SELECTs,
+    # and this runs for every buddy on the shared /api/friends payload).
+    counts = c.execute("""SELECT 'mocks' k, COUNT(*) n FROM mocks WHERE user_id=? AND day=?
+                          UNION ALL SELECT 'errors', COUNT(*) FROM errors WHERE user_id=? AND day=?""",
+                       (uid, t, uid, t)).fetchall()
+    cnt = {r["k"]: r["n"] for r in counts}
+    return merge_today_summary(act_rows, tgt_rows, cnt.get("mocks", 0), cnt.get("errors", 0))
 
 # ---------------------------------------------------------------- handler
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1137,6 +1226,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._restore_vercel_path()
+        # Fresh per-request memo: the worker thread is reused across requests
+        # (keep-alive), so nothing may survive from the previous one.
+        _begin_request()
         # Lazy migration bootstrap: Vercel may route the request to this root
         # module's function instead of api/index, so boot cannot live there
         # alone. Cheap no-op once the boot has succeeded on this worker.
@@ -1197,7 +1289,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 return self._server_error(p)
         try:
-            return self.static(p)
+            return self.static(p, q)
         except Exception:
             return self._server_error(p)
 
@@ -1221,6 +1313,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._restore_vercel_path()
+        _begin_request()  # see do_GET: the memo lives for exactly one request
         _ensure_boot()   # see do_GET: the bootstrap must run whichever function
         u = urlparse(self.path); p = u.path
         if p.startswith("/api/"):
@@ -1247,29 +1340,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._err("Not found", 404)
 
     # -------- static
-    def static(self, p):
+    # Files worth compressing when this server is the edge (Docker / HF Spaces /
+    # local). On Vercel the CDN already compresses and serves public/ itself.
+    _TEXT_EXT = frozenset(("html", "js", "css", "json", "svg", "xml", "txt", "webmanifest"))
+    # gzip result cache: keyed by (path, mtime, size) so a rebuild invalidates it.
+    _gzip_cache = {}
+
+    def static(self, p, q=None):
         if p == "/": p = "/index.html"
         fn = os.path.normpath(os.path.join(STATIC, p.lstrip("/")))
         # compare against STATIC + separator: a bare startswith() also accepts
         # sibling directories like ".../jee-war-room-secrets/x"
         if not fn.startswith(STATIC + os.sep) or not os.path.isfile(fn):
             fn = os.path.join(STATIC, "index.html")
+        ext = fn.rsplit(".", 1)[-1].lower()
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
                  "css": "text/css; charset=utf-8", "svg": "image/svg+xml", "png": "image/png",
                  "ico": "image/x-icon", "json": "application/json", "mp3": "audio/mpeg",
-                 "webm": "video/webm", "mp4": "video/mp4"}.get(fn.rsplit(".", 1)[-1], "application/octet-stream")
+                 "webm": "video/webm", "mp4": "video/mp4"}.get(ext, "application/octet-stream")
         with open(fn, "rb") as f: data = f.read()
+        st = os.stat(fn)
+        compressible = ext in self._TEXT_EXT
+        # Weak ETag from mtime+size: repeat visits answer 304 instead of
+        # re-sending app.js (145 KB) / styles.css (47 KB) / tour.html (1 MB).
+        etag = 'W/"%x-%x"' % (int(st.st_mtime), st.st_size)
+        if (self.headers.get("If-None-Match") or "").strip() == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            if compressible: self.send_header("Vary", "Accept-Encoding")
+            for k, v in self._security_headers(): self.send_header(k, v)
+            self.send_header("Cache-Control", self._cache_control(fn, q))
+            self.end_headers()
+            return
+        body = data
+        encoding = None
+        if compressible and len(data) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+            key = (fn, int(st.st_mtime), st.st_size)
+            cached = Handler._gzip_cache.get(key)
+            if cached is None:
+                import gzip as _gzip
+                cached = _gzip.compress(data, 6)
+                if len(Handler._gzip_cache) > 24: Handler._gzip_cache.clear()
+                Handler._gzip_cache[key] = cached
+            if len(cached) < len(data):
+                body = cached; encoding = "gzip"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+        if compressible: self.send_header("Vary", "Accept-Encoding")
         for k, v in self._security_headers(): self.send_header(k, v)
+        self.send_header("Cache-Control", self._cache_control(fn, q))
         if fn.endswith(".html"):
-            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
-        else:
-            # versioned asset urls (/app.js?v=N) are re-fetched whenever the version bumps
-            self.send_header("Cache-Control", "no-cache")
-        self.end_headers(); self.wfile.write(data)
+        self.end_headers(); self.wfile.write(body)
+
+    @staticmethod
+    def _cache_control(fn, q):
+        """Cache policy for one static file.
+
+        Versioned asset URLs (/app.js?v=23, bumped in index.html on every
+        change) can be cached for a year: a new build is a new URL. Everything
+        else — the HTML shell above all — revalidates, so a deploy is visible
+        on the next request (with the ETag above that is a cheap 304, not a
+        re-download).
+        """
+        if fn.endswith(".html"):
+            return "no-cache, must-revalidate"
+        if (q or {}).get("v"):
+            return "public, max-age=31536000, immutable"
+        return "no-cache"
 
     # ============================================================ GET API
     def api_get(self, user, p, q):
@@ -1283,13 +1425,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c.commit()
         try:
             if p == "/api/me":
-                ensure_snapshots(c, uid, s)
-                u = c.execute("SELECT id,name,code,partner_id,exam_date,avatar_color,created_at,role FROM users WHERE id=?", (uid,)).fetchone()
-                out = {"user": rowdict(u), "settings": s, "global": admin_settings(c),
-                       "summary": today_summary(c, uid, s),
-                       "xp": level_info(xp_total(c, uid)), "streak": streak_info(c, uid, s),
-                       "air": self._air(c, uid, s)}
-                return self._send(out)
+                return self._send(self.me_payload(c, user, s))
+            if p == "/api/bootstrap":
+                # First-load fan-in: ONE function invocation, one auth check and
+                # one Turso connection instead of four parallel ones (me +
+                # friends + announcements + chapters). Each sub-payload is
+                # byte-identical to what its own endpoint returns.
+                return self._send({
+                    "me": self.me_payload(c, user, s),
+                    "friends": self.friends_payload(c, uid),
+                    "announcements": self.announcements_payload(c, s),
+                    "chapters": self.chapters_payload(c, uid),
+                })
             if p == "/api/me/security": return self.security_info(c, uid)
             if p == "/api/targets":
                 day = q.get("date", [TODAY()])[0]
@@ -1297,10 +1444,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 rows = c.execute("SELECT * FROM targets WHERE user_id=? AND day=? ORDER BY id", (uid, day)).fetchall()
                 return self._send({"targets": [rowdict(r) for r in rows]})
             if p == "/api/chapters":
-                rows = c.execute("SELECT * FROM chapters WHERE user_id=? ORDER BY subject, sort, id", (uid,)).fetchall()
-                groups = defaultdict(list)
-                for r in rows: groups[r["subject"]].append(rowdict(r))
-                return self._send({"subjects": SUBJECTS, "chapters": dict(groups)})
+                return self._send(self.chapters_payload(c, uid))
             if p == "/api/activities":
                 days = int(q.get("days", ["30"])[0]); days = clamp(days, 1, 400)
                 start = DAY_F(datetime.now(IST).date() - timedelta(days=days - 1))
@@ -1320,19 +1464,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p == "/api/air":
                 return self._send(self._air(c, uid, s, with_comps=True, settings=s))
             if p == "/api/friends":
-                ids = friend_ids(c, uid)
-                views = [self._friend_view(c, uid, pid) for pid in ids]
-                return self._send({"connected": bool(ids), "count": len(ids),
-                                   "max": MAX_FRIENDS, "friends": [v for v in views if v]})
+                return self._send(self.friends_payload(c, uid))
             if p == "/api/messages":
                 return self._send(self.messages_list(c, uid, q))
             if p == "/api/announcements":
-                rows = c.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 50").fetchall()
-                seen = list(s.get("seenAnnouncements") or [])
-                out = []
-                for r in rows:
-                    d = rowdict(r); d["read"] = d["id"] in seen; out.append(d)
-                return self._send({"announcements": out})
+                return self._send(self.announcements_payload(c, s))
             if p == "/api/admin/reports":
                 if not self.is_admin(c, uid): return self._err("Admin only.", 403)
                 rows = c.execute("""SELECT r.id,r.body,r.created_at,r.resolved,r.user_id,u.name AS user_name
@@ -1364,6 +1500,217 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             c.close()
 
+    # -------- payload builders (shared by the individual endpoints and the
+    # combined /api/bootstrap first-load call, so the shapes can never drift)
+    def me_payload(self, c, user, s):
+        """Everything the app needs for its first paint.
+
+        `user` is the row _auth() already fetched (it selects exactly the
+        columns the client uses), so this no longer re-reads users.
+        """
+        uid = user["id"]
+        u = {k: v for k, v in user.items() if not k.startswith("_")}
+        if "role" not in u:
+            # legacy/half-migrated schema: _auth() fell back to the pre-role
+            # shape, so fetch the column that exists in the hardened one
+            r = c.execute("SELECT role FROM users WHERE id=?", (uid,)).fetchone()
+            u["role"] = r["role"] if r else None
+        # created_at is already in the auth row — pass it instead of re-reading
+        ensure_snapshots(c, uid, s, created_at=u.get("created_at"))
+        return {"user": u, "settings": s, "global": admin_settings(c),
+                "summary": today_summary(c, uid, s),
+                "xp": level_info(xp_total(c, uid)), "streak": streak_info(c, uid, s),
+                "air": self._air(c, uid, s)}
+
+    def chapters_payload(self, c, uid):
+        rows = c.execute("SELECT * FROM chapters WHERE user_id=? ORDER BY subject, sort, id", (uid,)).fetchall()
+        groups = defaultdict(list)
+        for r in rows: groups[r["subject"]].append(rowdict(r))
+        return {"subjects": SUBJECTS, "chapters": dict(groups)}
+
+    def announcements_payload(self, c, s):
+        rows = c.execute("SELECT * FROM announcements ORDER BY id DESC LIMIT 50").fetchall()
+        seen = list(s.get("seenAnnouncements") or [])
+        out = []
+        for r in rows:
+            d = rowdict(r); d["read"] = d["id"] in seen; out.append(d)
+        return {"announcements": out}
+
+    def friends_payload(self, c, uid):
+        ids = friend_ids(c, uid)
+        views = self.friend_views_bulk(c, uid, ids)
+        return {"connected": bool(ids), "count": len(ids),
+                "max": MAX_FRIENDS, "friends": views}
+
+    def friend_views_bulk(self, c, uid, ids):
+        """Buddy cards for the whole list in ~13 round trips instead of ~18
+        per buddy.
+
+        The old loop called _friend_view() per friend, and each of those did
+        its own users/settings/unread/summary/streak/xp/snapshot reads (plus a
+        fresh admin_settings read per friend). With 3 buddies that was 58
+        statements, all issued in series inside the shared /api/friends call
+        that loads on the very first screen — the single slowest endpoint in
+        the app. Everything below is grouped by user_id, and rows are absent
+        for a buddy who does not share that block, exactly like before.
+        """
+        out = {}
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        today_d = datetime.now(IST).date()
+        wk = DAY_F(today_d - timedelta(days=6))
+        since = DAY_F(today_d - timedelta(days=120))
+
+        users = {r["id"]: r for r in c.execute(
+            "SELECT id,name,code,exam_date,avatar_color FROM users WHERE id IN (%s)" % ph, tuple(ids)).fetchall()}
+        g = admin_settings(c)      # one read for the whole list (memoised)
+        settings = {}
+        for r in c.execute("SELECT user_id, json FROM settings WHERE user_id IN (%s)" % ph, tuple(ids)).fetchall():
+            try:
+                saved = json.loads(r["json"])
+            except Exception:
+                saved = None
+            settings[r["user_id"]] = apply_admin_settings(_settings_with_defaults(saved), g)
+        unread = {}
+        for r in c.execute("""SELECT sender, COUNT(*) n FROM messages
+                               WHERE recipient=? AND sender IN (%s) AND read_at IS NULL
+                                 AND %s GROUP BY sender""" % (ph, msg_visible(uid)),
+                           (uid,) + tuple(ids)).fetchall():
+            unread[r["sender"]] = r["n"]
+
+        metas = {}
+        for pid in ids:
+            pu = users.get(pid)
+            if not pu: continue
+            ps = settings.get(pid) or _settings_with_defaults(None)
+            sh = ps["sharing"]
+            metas[pid] = {"ps": ps, "sh": sh,
+                          "shareBlock": bool(sh.get("studyTime") or sh.get("targets") or sh.get("questions")),
+                          "streak": bool(sh.get("streak")), "xp": bool(sh.get("xp")),
+                          "mocks": bool(sh.get("mocks")), "distract": bool(sh.get("distractions")),
+                          "score": bool(sh.get("score")), "air": bool(sh.get("air"))}
+        if not metas:
+            return []
+
+        shared_block = [pid for pid, m in metas.items() if m["shareBlock"]]
+        # ---- today's summary for every buddy that shows one (2 round trips)
+        if shared_block:
+            ph2 = ",".join("?" * len(shared_block))
+            act = defaultdict(list)
+            for r in c.execute("""SELECT user_id, type, custom_key, SUM(amount) am, SUM(duration) dm, COUNT(*) n
+                                    FROM activities WHERE user_id IN (%s) AND day=? GROUP BY user_id, type, custom_key""" % ph2,
+                               tuple(shared_block) + (TODAY(),)).fetchall():
+                act[r["user_id"]].append(r)
+            tgt = defaultdict(list)
+            cnt = defaultdict(dict)
+            for r in c.execute("""SELECT user_id, 't_'||status k, NULL st, COUNT(*) n FROM targets
+                                    WHERE user_id IN (%s) AND day=? GROUP BY user_id, status
+                                   UNION ALL SELECT user_id, 'mocks', NULL, COUNT(*) FROM mocks
+                                    WHERE user_id IN (%s) AND day=? GROUP BY user_id
+                                   UNION ALL SELECT user_id, 'errors', NULL, COUNT(*) FROM errors
+                                    WHERE user_id IN (%s) AND day=? GROUP BY user_id""" % (ph2, ph2, ph2),
+                               tuple(shared_block) + (TODAY(),) + tuple(shared_block) + (TODAY(),) +
+                               tuple(shared_block) + (TODAY(),)).fetchall():
+                if r["k"].startswith("t_"):
+                    tgt[r["user_id"]].append({"status": r["k"][2:], "n": r["n"]})
+                else:
+                    cnt[r["user_id"]][r["k"]] = r["n"]
+            for pid in shared_block:
+                metas[pid]["summary"] = merge_today_summary(
+                    act.get(pid, []), tgt.get(pid, []),
+                    cnt[pid].get("mocks", 0), cnt[pid].get("errors", 0))
+
+        # ---- streak / xp / air / mocks / distraction blocks (one each)
+        need_streak = [pid for pid, m in metas.items() if m["streak"]]
+        if need_streak:
+            srows = streak_rows(c, need_streak, since)
+            for pid in need_streak:
+                metas[pid]["streak_val"] = streak_from_rows(srows.get(pid, []), metas[pid]["ps"], today_d)
+        need_xp = [pid for pid, m in metas.items() if m["xp"]]
+        # GROUP BY returns no row at all for a buddy with zero events, so seed
+        # the default first (the per-friend version always reached level_info(0))
+        for pid in need_xp: metas[pid]["xp_val"] = level_info(0)
+        if need_xp:
+            for r in c.execute("SELECT user_id, COALESCE(SUM(amount),0) v FROM xp_events WHERE user_id IN (%s) GROUP BY user_id"
+                               % ",".join("?" * len(need_xp)), tuple(need_xp)).fetchall():
+                metas[r["user_id"]]["xp_val"] = level_info(r["v"])
+        need_score = [pid for pid, m in metas.items() if m["score"] or m["air"]]
+        if need_score:
+            ph3 = ",".join("?" * len(need_score))
+            for r in c.execute("""SELECT s.user_id, s.score, s.air FROM snapshots s
+                                   JOIN (SELECT user_id, MAX(day) d FROM snapshots WHERE user_id IN (%s)
+                                          GROUP BY user_id) m
+                                     ON m.user_id=s.user_id AND m.d=s.day""" % ph3, tuple(need_score)).fetchall():
+                metas[r["user_id"]]["snap"] = r
+            d7 = DAY_F(today_d - timedelta(days=7))
+            for r in c.execute("SELECT user_id, air FROM snapshots WHERE user_id IN (%s) AND day=?" % ph3,
+                               tuple(need_score) + (d7,)).fetchall():
+                m = metas.get(r["user_id"])
+                if m is not None: m["air7"] = r["air"]
+        need_mocks = [pid for pid, m in metas.items() if m["mocks"]]
+        if need_mocks:
+            ph4 = ",".join("?" * len(need_mocks))
+            for r in c.execute("""SELECT * FROM mocks m WHERE m.user_id IN (%s)
+                                   AND m.id=(SELECT id FROM mocks WHERE user_id=m.user_id
+                                              ORDER BY day DESC, id DESC LIMIT 1)""" % ph4,
+                               tuple(need_mocks)).fetchall():
+                metas[r["user_id"]]["mock"] = self._mock_view(r)
+        need_distract = [pid for pid, m in metas.items() if m["distract"]]
+        for pid in need_distract: metas[pid]["distract_week"] = 0   # see need_xp
+        if need_distract:
+            ph5 = ",".join("?" * len(need_distract))
+            for r in c.execute("""SELECT user_id, COALESCE(SUM(duration),0) v FROM activities
+                                   WHERE user_id IN (%s) AND day>=? AND type='distraction'
+                                   GROUP BY user_id""" % ph5, tuple(need_distract) + (wk,)).fetchall():
+                metas[r["user_id"]]["distract_week"] = r["v"]
+
+        # ---- 7-day aggregates for the duel (2 round trips for all buddies)
+        if shared_block:
+            ph6 = ",".join("?" * len(shared_block))
+            week = defaultdict(lambda: {"minutes": 0, "questions": 0})
+            for r in c.execute("""SELECT user_id, type, SUM(duration) dm, SUM(amount) am FROM activities
+                                   WHERE user_id IN (%s) AND day>=? GROUP BY user_id, type""" % ph6,
+                               tuple(shared_block) + (wk,)).fetchall():
+                e = week[r["user_id"]]
+                if r["type"] in ('study', 'revision'): e["minutes"] += (r["dm"] or 0)
+                if r["type"] in ('pyq', 'dpp', 'homework'): e["questions"] += (r["am"] or 0)
+            tw = defaultdict(lambda: [0, 0.0])
+            for r in c.execute("""SELECT user_id, status, COUNT(*) n FROM targets
+                                   WHERE user_id IN (%s) AND day>=? GROUP BY user_id, status""" % ph6,
+                               tuple(shared_block) + (wk,)).fetchall():
+                tw[r["user_id"]][0] += r["n"]
+                if r["status"] == "done": tw[r["user_id"]][1] += r["n"]
+                elif r["status"] == "partial": tw[r["user_id"]][1] += 0.5 * r["n"]
+            for pid in shared_block:
+                planned, done = tw[pid][0], tw[pid][1]
+                e = week[pid]
+                metas[pid]["week"] = {"minutes": e["minutes"], "questions": e["questions"],
+                                      "planned": planned, "done": done,
+                                      "execution": round(100 * done / planned) if planned else 0}
+
+        # ---- assemble in the original friend order
+        for pid in ids:
+            pu = users.get(pid); m = metas.get(pid)
+            if not pu or not m: continue
+            o = {"connected": True, "uid": pid, "name": pu["name"], "avatarColor": pu["avatar_color"],
+                 "examDate": pu["exam_date"], "code": pu["code"], "unread": unread.get(pid, 0),
+                 "shareBlock": m["shareBlock"]}
+            if m["shareBlock"]: o["summary"] = m["summary"]
+            if m.get("streak_val") is not None: o["streak"] = m["streak_val"]
+            if m.get("xp_val") is not None: o["xp"] = m["xp_val"]
+            snap = m.get("snap"); cur_air = snap["air"] if snap else 600000
+            cur_score = snap["score"] if snap else 0.0
+            air7 = m.get("air7")
+            trend7 = (air7 - cur_air) if air7 is not None else 0
+            if m["score"]: o["score"] = cur_score
+            if m["air"]: o["air"] = cur_air; o["airFormatted"] = ind(cur_air); o["airTrend7"] = trend7
+            if m.get("mock") is not None: o["latestMock"] = m["mock"]
+            if "distract_week" in m: o["friendDistractWeek"] = m["distract_week"]
+            if "week" in m: o["week"] = m["week"]
+            out[pid] = o
+        return [out[pid] for pid in ids if pid in out]
+
     def _mock_view(self, r):
         d = rowdict(r)
         total = d["total"] or 300
@@ -1378,11 +1725,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _air(self, c, uid, s, with_comps=False, settings=None):
         ensure_snapshots(c, uid, s)
         t = TODAY()
-        cur = c.execute("SELECT * FROM snapshots WHERE user_id=? AND day=?", (uid, t)).fetchone()
-        rows = c.execute("SELECT * FROM snapshots WHERE user_id=? ORDER BY day DESC LIMIT 30", (uid,)).fetchall()
+        # ONE round trip: the last 30 snapshots already contain today, yesterday
+        # and the 7-days-ago row, so those used to be three extra Turso reads.
+        rows = c.execute("SELECT day, score, air FROM snapshots WHERE user_id=? ORDER BY day DESC LIMIT 30",
+                         (uid,)).fetchall()
+        by_day = {r["day"]: r for r in rows}
+        cur = by_day.get(t)
         hist = [{"day": r["day"], "score": r["score"], "air": r["air"]} for r in reversed(rows)]
-        d7 = c.execute("SELECT air FROM snapshots WHERE user_id=? AND day=?", (uid, DAY_F(datetime.now(IST).date() - timedelta(days=7)))).fetchone()
-        y = c.execute("SELECT air FROM snapshots WHERE user_id=? AND day=?", (uid, DAY_F(datetime.now(IST).date() - timedelta(days=1)))).fetchone()
+        today_d = datetime.now(IST).date()
+        d7 = by_day.get(DAY_F(today_d - timedelta(days=7)))
+        y = by_day.get(DAY_F(today_d - timedelta(days=1)))
         cur_air = cur["air"] if cur else 600000
         trend7 = (d7["air"] - cur_air) if d7 else 0   # positive = rank improved (number got smaller)
         out = {"air": cur_air, "airFormatted": ind(cur_air), "score": cur["score"] if cur else 0,

@@ -70,6 +70,34 @@ Measure before merging any change to the auth paths:
     python3 tools/diag_login_roundtrips.py    # prints the per-statement budget
     python3 tools/repro_login_500.py          # un-/half-migrated DB must still answer JSON
 
+## ⚠️ The first-load round-trip budget (hard constraint)
+
+The first screen is ONE request — `GET /api/bootstrap` — carrying the payloads
+of `/api/me`, `/api/friends`, `/api/announcements` and `/api/chapters`. It used
+to be those four endpoints fired in parallel: four function invocations (each
+with its own cold start and its own Turso TLS handshake), and `/api/friends`
+cost ~16 statements *per buddy* (164 with 10 buddies ≈ 4 s of round trips on a
+warm Mumbai database), while `/api/me` cost 21.
+
+Budget now: **`/api/bootstrap` <= 30 statements, `/api/me` <= 12,
+`/api/friends` <= 20 — and the buddy list must not grow with the buddy count**
+(+5 buddies may cost at most +6 statements).
+
+Keep it there by: resetting the per-request memo in `_begin_request()` (so
+`app_settings` is read once, not once per buddy), calling `ensure_snapshots()`
+at most once per request, batching the buddy list with `WHERE user_id IN (…)`
+(grouped summaries, one `streak_rows()` query for all buddies) and merging
+counters into `UNION ALL` queries instead of one SELECT each.
+
+Measure before merging any change to the boot path:
+
+    python3 tools/diag_boot_roundtrips.py     # budget + payload identity checks
+
+It also asserts that `/api/bootstrap`'s sub-payloads are byte-identical to the
+individual endpoints and that `friend_views_bulk()` still matches the old
+per-buddy implementation (kept in the tool as the oracle), so a "speed-up" that
+changes what the UI receives fails the run.
+
 ## ⚠️ Preview deployments share the PRODUCTION database
 
 Vercel env vars (`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`) are set for

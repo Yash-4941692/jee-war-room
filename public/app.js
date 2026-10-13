@@ -182,14 +182,47 @@ function ringSVG(pct, size=96, color="#22d3ee", txt="", sub=""){
 }
 
 /* ---------------- boot / auth ---------------- */
+
+/* First load = ONE request.
+   /api/bootstrap returns exactly what /api/me + /api/friends +
+   /api/announcements + /api/chapters return (same payload shapes), so the
+   server does one auth check, opens one database connection and occupies one
+   cold start instead of four parallel ones — the four-call burst was the main
+   reason a cold first load felt slow. */
+async function loadBootstrap(){
+  const d = await api("/api/bootstrap");
+  if(!d || !d.me || !d.me.user) throw new Error("bootstrap unavailable");
+  state.me = d.me;
+  state.friends = (d.friends && d.friends.friends) || [];
+  state.announcements = (d.announcements && d.announcements.announcements) || [];
+  if(d.chapters) applyChapters(d.chapters);
+  // Chat warm-up runs AFTER the first paint: it used to fire during boot and
+  // compete with the boot burst for cold starts / database connections.
+  fire(()=>idle(prefetchThreads));
+}
+
+/* Run housekeeping work only once the browser is actually idle. */
+function idle(fn){
+  try{
+    if(window.requestIdleCallback) return window.requestIdleCallback(fn, {timeout: 3000});
+  }catch(e){}
+  return setTimeout(fn, 1200);
+}
+
+/* fallback path for an older server (mid-deploy): the original fan-out */
+async function loadBootLegacy(){
+  await reloadMe(true);
+  try{ await loadChapters(true); }catch(e){}
+}
+
 async function init(){
   if(!getToken()){
     showAuth();
     return;
   }
   try{
-    await reloadMe(true);
-    try{ await loadChapters(true); }catch(e){}
+    try{ await loadBootstrap(); }
+    catch(e){ await loadBootLegacy(); }
     enterApp();
   }catch(e){ showAuth(); }
 }
@@ -277,7 +310,7 @@ async function submitResetPassword(){
     if(r.token) setToken(r.token);
     closeModal();
     toast("Password reset! Logging in…", "good");
-    await reloadMe(true);
+    try{ await loadBootstrap(); }catch(e){ await loadBootLegacy(); }
     enterApp();
     if(typeof r.recoveryRemaining === "number" && r.recoveryRemaining <= 2){
       setTimeout(()=>toast(`Only ${r.recoveryRemaining} recovery code(s) left — generate more in Settings`,""),600);
@@ -403,7 +436,9 @@ async function authSubmit(ev){
     }else{
       const r = await api("/api/auth/login",{name,password:pw});
       if(r.token) setToken(r.token);
-      await reloadMe(true); enterApp();
+      // one request for the whole first screen (me + friends + announcements + chapters)
+      try{ await loadBootstrap(); }catch(e){ await loadBootLegacy(); }
+      enterApp();
       // Accounts created before recovery codes existed get their first set on
       // the first successful sign-in after the upgrade (server sends it once).
       if(r.recoveryCodes) showRecoveryCodes(r.recoveryCodes, {reason:"login"});
@@ -420,11 +455,10 @@ async function connectAfter(){
 async function enterApp(){
   try{
     if(!state.me){
-      await Promise.all([
-        reloadMe(true),
-        loadChapters(true).catch(()=>{})
-      ]);
-    } else { try{ await loadChapters(true); }catch(e){} }
+      // login/signup path: still one request for the whole first screen
+      try{ await loadBootstrap(); }
+      catch(e){ await loadBootLegacy(); }
+    } else { try{ await loadChapters(); }catch(e){} }   // only if not loaded yet
   }catch(e){ showAuth(); return; }
   $("#boot").classList.add("hidden"); $("#auth").classList.add("hidden");
   $("#auth-form").classList.remove("hidden"); $("#auth-after").classList.add("hidden");
@@ -1170,13 +1204,17 @@ async function tmSave(id){
 
 /* ============================================================ JEE CHAPTERS */
 let jeeSub="Physics";
-async function loadChapters(force){
-  if(!state.chapters||force) state.chapters=await api("/api/chapters");
+function applyChapters(payload){
+  state.chapters = payload;
   // compute syllabus %
+  const ch = (state.chapters && state.chapters.chapters) || {};
   let total=0,done=0,prog=0;
-  for(const sub of SUBJECTS){ for(const c of (state.chapters.chapters[sub]||[])){ if(c.hidden)continue; total++;
+  for(const sub of SUBJECTS){ for(const c of (ch[sub]||[])){ if(c.hidden)continue; total++;
     if(c.status==="completed"){done++;prog++;} else if(c.status==="in_progress"||c.status==="revision_needed") prog+=0.5; } }
   state.syllabusPct=total?Math.round(100*prog/total):0; state.syllabusDone=done; state.syllabusTotal=total;
+}
+async function loadChapters(force){
+  if(!state.chapters||force) applyChapters(await api("/api/chapters"));
 }
 async function renderJee(){
   await loadChapters();

@@ -7,7 +7,12 @@
 <meta name="theme-color" content="#0a0d13">
 <title>JEE WAR ROOM</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
-<link rel="stylesheet" href="/styles.css?v=23">
+<link rel="stylesheet" href="/styles.css?v=24">
+<!-- Start the app bundle download while the (small) HTML is still parsing:
+     the script tag below is at the end of <body>, so without this the fetch
+     only begins after parsing finishes — a full extra round trip on mobile.
+     URL must stay identical to the <script src> at the end of the file. -->
+<link rel="preload" href="/app.js?v=24" as="script">
 </head>
 <body>
 <div id="boot" class="boot"><div class="boot-mark">🎯</div><div class="boot-txt">JEE WAR ROOM</div></div>
@@ -76,12 +81,15 @@
 
 <div id="modal-root"></div>
 <div id="toast-root"></div>
-<script src="/app.js?v=23"></script>
-<!-- Vercel Web Analytics using @vercel/analytics package -->
-<script type="module">
-  import { inject } from 'https://esm.sh/@vercel/analytics@2.0.1';
-  inject();
-</script>
+<script src="/app.js?v=24"></script>
+<!-- Vercel Web Analytics — the platform's own same-origin script (deferred).
+     This used to `import` @vercel/analytics from esm.sh, a THIRD-PARTY origin:
+     every first load paid DNS + TLS + module-graph fetches to esm.sh before it
+     could even start, and the CSP in server.py (`script-src 'self'`) blocks it
+     outright on the self-hosted/Hugging Face deployment. The script below is
+     served by Vercel from this origin, does the same job, and never blocks the
+     page. -->
+<script defer src="/_vercel/insights/script.js"></script>
 <!-- Vercel Speed Insights -->
 <script>
   window.si = window.si || function () { (window.siq = window.siq || []).push(arguments); };
