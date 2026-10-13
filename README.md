@@ -35,6 +35,7 @@ hardening, and the admin to-do list.
     python3 tools/account_recovery.py --help    # recover/verify/reset an account
     python3 tools/selftest_auth.py              # 51 auth security checks
     python3 tools/selftest_migration.py         # old-schema migration checks
+    node tools/js/icons_test.js                 # icons/manifest/service worker (server on :8080)
 
 ## Layout
 
@@ -42,7 +43,10 @@ hardening, and the admin to-do list.
 - `authsec.py` — password/session/recovery-code/throttling primitives
 - `dbwrap.py` — database adapter (local sqlite3 / cloud libSQL)
 - `syllabus.py` — 61 PCM chapters
-- `public/` — single-page frontend (index.html, app.js, styles.css)
+- `public/` — single-page frontend (index.html, app.js, styles.css), plus the
+  real app icons, `manifest.webmanifest` and the inert `sw.js` that lets the
+  site be installed as an app (`python3 tools/make_icons.py` regenerates every
+  icon; icons + manifest are checked by `node tools/js/icons_test.js`)
 - `tools/turso_io.py` — cloud migration and SQL dump tooling (dumps are redacted
   by default; `--full` refuses to write inside the repo)
 - `guardian.sh` / `supervise.sh` — interim sandbox keep-alive scripts

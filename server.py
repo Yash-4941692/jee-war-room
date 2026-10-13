@@ -1519,7 +1519,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
                  "css": "text/css; charset=utf-8", "svg": "image/svg+xml", "png": "image/png",
                  "ico": "image/x-icon", "json": "application/json", "mp3": "audio/mpeg",
-                 "webm": "video/webm", "mp4": "video/mp4"}.get(ext, "application/octet-stream")
+                 "webm": "video/webm", "mp4": "video/mp4",
+                 # The PWA manifest. Vercel's CDN serves it as application/manifest+json
+                 # on its own; on Docker / HF Spaces / the tunnel this handler is the
+                 # only thing that sets the type, and Chrome ignores a manifest sent as
+                 # application/octet-stream (which would silently kill installability).
+                 "webmanifest": "application/manifest+json"}.get(ext, "application/octet-stream")
         with open(fn, "rb") as f: data = f.read()
         st = os.stat(fn)
         compressible = ext in self._TEXT_EXT

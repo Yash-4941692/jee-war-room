@@ -1,0 +1,46 @@
+{
+  "id": "/",
+  "name": "JEE War Room — JEE Main Study Tracker",
+  "short_name": "JEE War Room",
+  "description": "Free, ad-free JEE Main study tracker for aspirants who study in pairs: daily activity log, focus timer, targets with execution percentage, chapter-wise syllabus progress, mock analysis, mistake notebook, streak and a transparent projected-AIR estimate.",
+  "lang": "en-IN",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#0a0d13",
+  "background_color": "#0a0d13",
+  "categories": ["education", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-maskable-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
+    }
+  ]
+}

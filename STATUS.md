@@ -103,7 +103,29 @@
   is ~28 KB (the player is cached as an immutable `?v=` asset instead of being
   re-downloaded with the HTML on every visit). Missing assets now 404 instead
   of returning the HTML shell. See DEPLOY.md → "SEO / crawlers / agentic
-  browsing" for the three rules that keep this correct.
+  browsing" for the rules that keep this correct.
+- **App icons + installability (2026-10-13):** the app had no usable icon
+  anywhere except a browser tab — the favicon was an inline SVG *data URI*
+  holding the 🎯 emoji. A data URI has no URL, so Chrome/Edge could not put an
+  icon on an installed app (manifest icons must be fetchable files), iOS had
+  nothing for the home screen, and Google Search, which needs a square
+  crawlable icon at a multiple of 48px, showed a generic globe. Now `public/`
+  ships real files drawn from the app palette by `python3 tools/make_icons.py`
+  (deterministic Pillow render, supersampled; build-time only):
+  `favicon.ico` (16+32+48), `favicon-96x96.png` (Google's size),
+  `icon.svg`, `icon-192.png` / `icon-512.png` and `icon-maskable-192/512.png`
+  (Android adaptive), `apple-touch-icon.png` (180, opaque). New
+  `public/manifest.webmanifest` (standalone, `start_url /`, theme `#0a0d13`,
+  192/512 `any` + `maskable`) makes the site installable as a real app, and
+  `public/sw.js` — registered from `app.js`, inert by design, no `respondWith`,
+  caches NOTHING — exists only because Chromium requires a service worker with
+  a `fetch` handler before it offers the full install flow; caching stays the
+  server's job so live study data is never served stale. `vercel.json` and
+  `server.py`'s static handler both pin
+  `Content-Type: application/manifest+json`. Guarded by
+  `tools/js/icons_test.js` (no npm deps). Caveats: an already-installed app or
+  home-screen shortcut keeps its old/blank icon until it is re-added, and
+  Google re-reads favicons on its own crawl — days to weeks.
 - **First-load budget (HARD CONSTRAINT, 2026-10-13):** the whole first screen
   (me + friends + announcements + chapters) is ONE request —
   `GET /api/bootstrap` — at **<= 30 SQL statements**; `GET /api/me` <= 12 and

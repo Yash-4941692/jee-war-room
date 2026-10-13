@@ -85,7 +85,7 @@ function installMocks(window) {
   window.confirm = () => true;
 }
 
-/* Load the page from the live server so the real <script src="/app.js?v=25">
+/* Load the page from the live server so the real <script src="/app.js?v=...">
    and the inline onsubmit="return App.authSubmit(event)" wiring are exercised
    exactly as a browser runs them. */
 JSDOM.fromURL("http://127.0.0.1:8080/", {

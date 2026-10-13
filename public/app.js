@@ -2487,3 +2487,16 @@ return {
 };
 })();
 App.init();
+
+/* Register the purposefully inert service worker (public/sw.js — it caches
+   nothing). Chrome/Edge only offer the real install flow — own window, our
+   192/512 icons, a WebAPK on Android instead of a letter tile — when a service
+   worker with a fetch handler is registered. Deferred to `load` so it never
+   competes with the boot requests, and failure is non-fatal: the site works
+   exactly the same without it (and Safari/old browsers may refuse to
+   register one at all). */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    try { navigator.serviceWorker.register("/sw.js").catch(() => {}); } catch (e) {}
+  });
+}
