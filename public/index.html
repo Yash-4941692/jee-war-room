@@ -5,9 +5,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0a0d13">
-<title>JEE WAR ROOM</title>
+<title>JEE War Room — Free JEE Main Study Tracker, Syllabus &amp; Projected AIR</title>
+<meta name="description" content="Free JEE Main study tracker for serious aspirants: log DPPs, PYQs, lectures and mocks, track chapter-wise syllabus progress, keep a daily streak and watch a projected-AIR estimate move. No ads, no feeds, no clutter.">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<link rel="canonical" href="https://jee-war-room-three.vercel.app/">
+<!-- Social / chat preview cards (also what agentic browsers show when they cite the page) -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="JEE War Room">
+<meta property="og:title" content="JEE War Room — Free JEE Main Study Tracker, Syllabus &amp; Projected AIR">
+<meta property="og:description" content="Log DPPs, PYQs, lectures, focus sessions and mocks. Track chapter-wise syllabus progress, keep a streak, and watch a transparent projected-AIR estimate move. Free, no ads.">
+<meta property="og:url" content="https://jee-war-room-three.vercel.app/">
+<meta property="og:image" content="https://jee-war-room-three.vercel.app/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="JEE War Room — a dark, minimal JEE Main study tracker with an orange target mark">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="JEE War Room — Free JEE Main Study Tracker &amp; Projected AIR">
+<meta name="twitter:description" content="Daily activity log, syllabus tracker, streak, mocks and a transparent projected-AIR estimate. Free, no ads.">
+<meta name="twitter:image" content="https://jee-war-room-three.vercel.app/og.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
-<link rel="stylesheet" href="/styles.css?v=23">
+<link rel="stylesheet" href="/styles.css?v=25">
+<!-- Start the app bundle download while the (small) HTML is still parsing:
+     the script tag below is at the end of <body>, so without this the fetch
+     only begins after parsing finishes — a full extra round trip on mobile.
+     URL must stay identical to the <script src> at the end of the file. -->
+<link rel="preload" href="/app.js?v=25" as="script">
 </head>
 <body>
 <div id="boot" class="boot"><div class="boot-mark">🎯</div><div class="boot-txt">JEE WAR ROOM</div></div>
@@ -74,14 +96,149 @@
   <button class="fab" id="fab" onclick="App.openLog()">⚡<span>LOG ACTIVITY</span></button>
 </div>
 
+<!-- ============================================================
+     PUBLIC CONTENT (server-rendered, crawlable)
+     The app itself is behind a login, so search engines and agentic
+     browsers otherwise see an empty shell. This section is real, honest
+     copy that is visible to logged-out visitors — app.js hides it once
+     the signed-in app renders (see enterApp()).
+     ============================================================ -->
+<section id="landing" class="landing">
+  <h1>JEE War Room — the JEE Main study tracker built for two</h1>
+  <p class="landing-lead">JEE War Room is a free, ad-free web app for JEE Main and JEE Advanced aspirants who
+    study in pairs. It turns a day of preparation into numbers you can act on: hours and questions logged,
+    chapter-wise syllabus progress, daily execution against your targets, mock-test accuracy, a mistake
+    notebook, a study streak, and a transparent projected-AIR estimate — with a buddy beside you to keep it honest.</p>
+
+  <div class="landing-grid">
+    <article><h3>📝 Activity log</h3><p>Log lectures, revision, DPPs, previous-year questions, homework, focus
+      sessions and custom metrics in a few taps. Every entry rolls up into today's questions and study minutes.</p></article>
+    <article><h3>⏱️ Focus timer</h3><p>Start a 25/45/90-minute session, pause and resume it, and see exactly how many
+      minutes of real study (and how much distraction) the week actually contained.</p></article>
+    <article><h3>🎯 Daily targets &amp; execution %</h3><p>Plan what today looks like, mark each target done,
+      partially done or missed, and get an execution percentage instead of a vague feeling of "I studied".</p></article>
+    <article><h3>📚 Chapter-wise syllabus tracker</h3><p>The full JEE Main chapter list for Physics, Chemistry and
+      Mathematics, with per-chapter status and lecture counters, so you always know what is untouched.</p></article>
+    <article><h3>📈 Mock test analysis</h3><p>Record total score and the subject split, and track accuracy and score
+      trends across every test you take — part tests, coaching tests and full JEE Main mocks.</p></article>
+    <article><h3>🔁 Mistake notebook</h3><p>Log the questions you got wrong with an error type — concept,
+      calculation, silly mistake, misread, guess, time pressure — and see which pattern keeps costing you marks.</p></article>
+    <article><h3>🏆 Streak, XP and levels</h3><p>A day counts when you actually studied. Streaks make
+      consistency visible, and XP/levels reward the boring, repeated work that ranks are built on.</p></article>
+    <article><h3>⚔️ Buddy duels</h3><p>Two aspirants, one room: compare weekly minutes, questions and target
+      execution, and message each other. Only the blocks you explicitly share are visible to your buddy.</p></article>
+    <article><h3>🔒 Private by default</h3><p>Passwords are stored as one-way PBKDF2-HMAC-SHA256 hashes, sessions
+      as digests with a 30-day expiry. No ad networks, no social feed, no third-party tracking pixels.</p></article>
+  </div>
+
+  <h2>How it works</h2>
+  <ol class="landing-steps">
+    <li><b>Create your account</b> — pick a name and password and set your JEE Main exam date for the countdown.</li>
+    <li><b>Log your day</b> — activities, focus sessions, targets and mistakes take seconds to record.</li>
+    <li><b>Review the week</b> — study minutes, questions, syllabus progress, accuracy and projected AIR, in one screen.</li>
+  </ol>
+  <p>Want to see every screen before signing up? <a href="/tour.html">Watch the narrated 1-minute tour →</a></p>
+
+  <h2>Frequently asked questions</h2>
+  <dl class="landing-faq">
+    <dt>Is JEE War Room free?</dt>
+    <dd>Yes. It is free to use, has no ads and does not sell data. It is a small, independent project, not a coaching institute.</dd>
+
+    <dt>Does it predict my JEE rank?</dt>
+    <dd>No — and it never claims to. The projected AIR is a transparent, deterministic estimate built from your own
+      logged consistency, targets, practice, revision and mock performance, shown with the word <b>estimate</b> on screen.
+      It is a direction-of-travel signal, not a rank prediction.</dd>
+
+    <dt>Which syllabus does the tracker cover?</dt>
+    <dd>The JEE Main chapter list for Physics, Chemistry and Mathematics ships with every account (61 chapters by
+      default) and you can add, hide or rename chapters to match your own coaching material.</dd>
+
+    <dt>Do I need a study partner to use it?</dt>
+    <dd>No. Everything works solo, and you can connect a buddy later with a friend code. Buddy views respect your
+      per-block sharing switches — study time, targets, questions, streak, XP, score, projected AIR and distractions
+      are each opt-in.</dd>
+
+    <dt>Where is my data stored?</dt>
+    <dd>Server-side in a libSQL (Turso) database — not in your browser, so it survives clearing site data and syncs
+      across your devices. Passwords are one-way hashes and session tokens are stored only as SHA-256 digests.</dd>
+
+    <dt>Does it work on a phone?</dt>
+    <dd>Yes. The interface is built mobile-first with a bottom navigation bar, and it can be added to your home screen
+      like an app.</dd>
+  </dl>
+
+  <p class="landing-foot">Not affiliated with the National Testing Agency (NTA), JEE, or any coaching institute.
+    Study hard — the tracker just keeps score.</p>
+</section>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebApplication",
+      "@id": "https://jee-war-room-three.vercel.app/#app",
+      "name": "JEE War Room",
+      "url": "https://jee-war-room-three.vercel.app/",
+      "applicationCategory": "EducationalApplication",
+      "operatingSystem": "Any modern web browser (desktop and mobile)",
+      "inLanguage": "en-IN",
+      "description": "Free JEE Main study tracker for aspirants who study in pairs: daily activity log, focus timer, targets with execution percentage, chapter-wise syllabus progress, mock analysis, mistake notebook, streak, XP and a transparent projected-AIR estimate.",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "INR" },
+      "featureList": [
+        "Daily study activity log (lectures, revision, DPPs, PYQs, homework)",
+        "Focus timer with pause and resume",
+        "Daily targets with execution percentage",
+        "Chapter-wise JEE Main syllabus tracker",
+        "Mock test score and accuracy analysis",
+        "Mistake notebook with error types",
+        "Study streak, XP and levels",
+        "Buddy comparison with per-block sharing controls",
+        "Transparent projected-AIR estimate (not a rank prediction)"
+      ],
+      "isAccessibleForFree": true
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://jee-war-room-three.vercel.app/#website",
+      "url": "https://jee-war-room-three.vercel.app/",
+      "name": "JEE War Room",
+      "description": "Free JEE Main study tracker, syllabus progress and projected-AIR estimate for two aspirants studying together.",
+      "inLanguage": "en-IN"
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://jee-war-room-three.vercel.app/#faq",
+      "mainEntity": [
+        { "@type": "Question", "name": "Is JEE War Room free?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. It is free to use, has no ads and does not sell data. It is a small, independent project, not a coaching institute." } },
+        { "@type": "Question", "name": "Does JEE War Room predict my JEE rank?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. The projected AIR is a transparent, deterministic estimate built from your logged consistency, targets, practice, revision and mock performance. It is a direction-of-travel signal, not a rank prediction." } },
+        { "@type": "Question", "name": "Which syllabus does the tracker cover?",
+          "acceptedAnswer": { "@type": "Answer", "text": "The JEE Main chapter list for Physics, Chemistry and Mathematics ships with every account (61 chapters by default), and chapters can be added, hidden or renamed to match your own coaching material." } },
+        { "@type": "Question", "name": "Do I need a study partner to use JEE War Room?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. It works solo; a buddy can be connected later with a friend code, and every shared block (study time, targets, questions, streak, XP, score, projected AIR, distractions) is opt-in." } },
+        { "@type": "Question", "name": "Where is my data stored?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Server-side in a libSQL (Turso) database, not in the browser. Passwords are stored as one-way PBKDF2-HMAC-SHA256 hashes and session tokens only as SHA-256 digests." } },
+        { "@type": "Question", "name": "Does JEE War Room work on a phone?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. The interface is mobile-first with a bottom navigation bar and can be added to your home screen like an app." } }
+      ]
+    }
+  ]
+}
+</script>
+
 <div id="modal-root"></div>
 <div id="toast-root"></div>
-<script src="/app.js?v=23"></script>
-<!-- Vercel Web Analytics using @vercel/analytics package -->
-<script type="module">
-  import { inject } from 'https://esm.sh/@vercel/analytics@2.0.1';
-  inject();
-</script>
+<script src="/app.js?v=25"></script>
+<!-- Vercel Web Analytics — the platform's own same-origin script (deferred).
+     This used to `import` @vercel/analytics from esm.sh, a THIRD-PARTY origin:
+     every first load paid DNS + TLS + module-graph fetches to esm.sh before it
+     could even start, and the CSP in server.py (`script-src 'self'`) blocks it
+     outright on the self-hosted/Hugging Face deployment. The script below is
+     served by Vercel from this origin, does the same job, and never blocks the
+     page. -->
+<script defer src="/_vercel/insights/script.js"></script>
 <!-- Vercel Speed Insights -->
 <script>
   window.si = window.si || function () { (window.siq = window.siq || []).push(arguments); };

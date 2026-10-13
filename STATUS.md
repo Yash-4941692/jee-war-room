@@ -63,6 +63,74 @@
     `RuntimeError`s and poisoned clients replaced. Cloud `executescript`
     strips `--` comments before splitting (a `;` inside the recovery_codes
     comment used to break the DDL with "incomplete input").
+- **Auth robustness (2026-10-13) — the "Not authenticated" bug:** `_auth()`
+  tried the session COOKIE first and returned None if that session was gone,
+  without ever checking the `Authorization: Bearer …` token the client sends in
+  parallel. Any stale cookie (an older deployment's session, a session revoked
+  on another device, a cookie left on the domain by a preview URL) therefore
+  produced a random 401 — and app.js clears the stored token on a 401, so one
+  bad cookie signed the user out permanently. Both credentials are now tried
+  (`_auth_row()` per candidate); regression checks live in
+  `tools/selftest_auth.py` ("stale cookie does NOT shadow a valid bearer
+  token", "stale token does NOT shadow a valid session cookie", "a cookie-only
+  stale session is still rejected") — the first one FAILS against the previous
+  code, which is exactly what production was doing.
+- **Cold-start / warmth (2026-10-13):** `.github/workflows/keepalive.yml` was
+  **missing from the repo** even though DEPLOY.md/STATUS.md referenced it, so
+  nothing kept the free-tier Turso database awake: the login POST was the first
+  DB contact for a returning visitor and paid the ~15-20 s wake. Restored
+  (twice an hour; ~1440 of 2000 free Actions minutes/month). The client also
+  stopped *blocking* on `/healthz` before submitting the login form — the wake
+  now starts at page load in the background (`warmUpServer()` fire-and-forget),
+  so it overlaps with the user typing. A transient boot failure now shows a
+  retry screen (with the session intact) instead of dumping the user on the
+  login screen; only a real 401 clears the token.
+- **SEO / discoverability (2026-10-13):** `robots.txt` and `sitemap.xml` were
+  static files hard-coding **the wrong domain** (`jee-warfare.vercel.app`; the
+  app runs on `jee-war-room-three.vercel.app`) — the sitemap was advertised on
+  a host that does not exist and every URL in it belonged to another domain.
+  They are now generated per request from the serving host (`site_base()`,
+  override with `CANONICAL_HOST`), and `/llms.txt` was added for AI/agentic
+  crawlers. The HTML pages carry the production base literally (`PROD_BASE`,
+  `server.py`) rather than a placeholder, because Vercel's CDN serves
+  `public/*.html` itself (filesystem before rewrites) and would otherwise ship
+  an unsubstituted token to real visitors. `/` gained a crawlable landing block (features, how it works, FAQ)
+  behind the login card, real meta description + canonical + Open Graph +
+  Twitter tags, `WebApplication`/`WebSite`/`FAQPage` JSON-LD and an
+  `og.png` preview card (1200x630, `tools/make_og_image.py`). `/tour.html` got
+  the same meta treatment plus `WebPage`/`BreadcrumbList` JSON-LD, and its
+  ~1 MB inline player+audio script moved to `public/tour.js` so the page itself
+  is ~28 KB (the player is cached as an immutable `?v=` asset instead of being
+  re-downloaded with the HTML on every visit). Missing assets now 404 instead
+  of returning the HTML shell. See DEPLOY.md → "SEO / crawlers / agentic
+  browsing" for the three rules that keep this correct.
+- **First-load budget (HARD CONSTRAINT, 2026-10-13):** the whole first screen
+  (me + friends + announcements + chapters) is ONE request —
+  `GET /api/bootstrap` — at **<= 30 SQL statements**; `GET /api/me` <= 12 and
+  `GET /api/friends` <= 20, and the buddy list must NOT grow with the buddy
+  count (verified by `tools/diag_boot_roundtrips.py`, which also proves the
+  bootstrap payloads are byte-identical to the per-endpoint payloads and that
+  the batched buddy list matches the old per-buddy code it replaced).
+  Before: 4 parallel function invocations, `/api/me` 21 statements,
+  `/api/friends` ~16 statements *per buddy* (164 with 10 buddies ≈ 4 s of
+  Turso round trips on a warm connection). Now: 26 statements in one request.
+  Rules that keep it there: `_begin_request()` resets a per-request memo
+  (`app_settings` read once instead of once per buddy), `ensure_snapshots()`
+  runs at most once per request, the buddy list uses `WHERE user_id IN (…)`
+  bulk queries + one `streak_rows()` query for everyone, and counters are
+  merged into `UNION ALL` statements. Serve with `/api/bootstrap` on the first
+  load in the client (`loadBootstrap()`), with the old four-call fan-out as a
+  fallback for a server that predates the endpoint (mid-deploy).
+- **Assets/edge (2026-10-13):** `?v=N` versioned URLs are `immutable` for a
+  year — **bump `?v=` in public/index.html and public/tour.html whenever
+  styles.css/app.js change** (currently v24); HTML is `no-cache` + weak ETag
+  (304s, bfcache) instead of `no-store`; the Docker/HF-Spaces path gzips text
+  assets (app.js 145 KB → ~42 KB) and stops re-sending them on every visit.
+  vercel.json mirrors the same Cache-Control rules for the edge-cached copies.
+  Vercel Web Analytics is now the platform's own same-origin
+  `/_vercel/insights/script.js` (deferred): the previous esm.sh ES-module
+  import cost every first load a third-party DNS + TLS + module fetch and was
+  blocked outright by the self-hosted CSP.
 - **v8 features:** admin-only 📢 Announce composer + per-user unread banner on
   Home/Today (`announcements` table; read state in settings.seenAnnouncements);
   admin 👥 Registered Users panel with password RESET (passwords are PBKDF2

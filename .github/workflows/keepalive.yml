@@ -1,0 +1,55 @@
+name: keepalive
+
+# Keeps the Turso free-tier database AWAKE and the Vercel function warm.
+#
+# Why this file matters: a suspended free-tier libSQL database takes ~15-20 s
+# to answer its first query, and the login POST is the first database contact a
+# returning visitor makes. Without a periodic ping every visit paid that wake
+# BEFORE it could authenticate — the "login takes too long" symptom. This
+# workflow is referenced by DEPLOY.md ("GitHub pings /healthz every 30 minutes")
+# and had gone missing from the repo; it is restored here.
+#
+# Budget note (private repo → GitHub Actions minutes are metered, 2000/month on
+# the free plan): two runs an hour = ~1440 runs/month ≈ 1440 billed minutes
+# (GitHub rounds each job up to a minute). Do NOT increase the frequency past
+# this without checking the Actions usage page — every-5-minutes would blow the
+# free allowance. For a tighter heartbeat, point an external uptime monitor
+# (UptimeRobot, cron-job.org) at the same URL; see DEPLOY.md.
+#
+# One-off runs: Actions → keepalive → Run workflow (workflow_dispatch).
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # twice an hour, off the hour to dodge cron congestion
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /healthz (wakes the database, warms the function)
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://jee-war-room-three.vercel.app/healthz?detail=1' }}
+        run: |
+          set -u
+          # A suspended database can take ~20 s to wake; --max-time 45 covers the
+          # cold path, and the loop retries so a single slow wake is not a red X
+          # (a failed run would otherwise mean "keepalive is broken" noise).
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 45 "$HEALTH_URL" || true)
+            body=$(cat /tmp/health.json 2>/dev/null || echo '')
+            echo "attempt $attempt -> HTTP ${code:-none}"
+            echo "$body"
+            if [ "$code" = "200" ] && printf '%s' "$body" | grep -q '"ok": *true'; then
+              if printf '%s' "$body" | grep -q '"bootOk": *true'; then
+                echo "keepalive OK (database awake, boot applied)"
+              else
+                echo "keepalive: server answered but boot did not apply — check /healthz bootError"
+                printf '%s' "$body" | grep -o '"bootError":[^,]*' || true
+              fi
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::keepalive failed after 3 attempts — /healthz did not report ok"
+          exit 1

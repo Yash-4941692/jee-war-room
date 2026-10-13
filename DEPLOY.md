@@ -7,7 +7,17 @@ cloud SQLite/libSQL database in aws-us-east-1, next to Vercel's free region).
 - No credit card anywhere.
 - Data lives entirely in Turso; the function container is stateless.
 - Each push to `main` auto-deploys via `.github/workflows/deploy-vercel.yml`.
-- GitHub pings `/healthz` every 30 minutes (warmth + uptime): `keepalive.yml`.
+- GitHub pings `/healthz` twice an hour (warmth + uptime): `keepalive.yml`.
+  **This file was missing from the repo** (the docs referenced it, but only
+  `db-backup.yml` and `deploy-vercel.yml` existed), which is why every visit
+  after an idle gap paid a free-tier **database wake** — ~15-20 s — before the
+  login POST could even start. It is restored; keep it. Two runs an hour costs
+  ~1440 of the 2000 free Actions minutes/month on a private repo, so do not
+  make it more frequent. For a tighter heartbeat, point an external uptime
+  monitor (UptimeRobot / cron-job.org) at `https://<host>/healthz?detail=1`.
+- Not affiliated with NTA/JEE. Nothing on this site claims a rank prediction:
+  the projected AIR is labelled an estimate everywhere it appears (see the
+  `WebApplication` + `FAQPage` JSON-LD in `public/index.html`).
 - Weekly database dump: `db-backup.yml` uploads **private, expiring workflow
   artifacts** (redacted 90 days, full 30 days). It deliberately no longer
   commits a dump to the repo — a committed dump previously leaked password
@@ -69,6 +79,34 @@ Measure before merging any change to the auth paths:
 
     python3 tools/diag_login_roundtrips.py    # prints the per-statement budget
     python3 tools/repro_login_500.py          # un-/half-migrated DB must still answer JSON
+
+## ⚠️ The first-load round-trip budget (hard constraint)
+
+The first screen is ONE request — `GET /api/bootstrap` — carrying the payloads
+of `/api/me`, `/api/friends`, `/api/announcements` and `/api/chapters`. It used
+to be those four endpoints fired in parallel: four function invocations (each
+with its own cold start and its own Turso TLS handshake), and `/api/friends`
+cost ~16 statements *per buddy* (164 with 10 buddies ≈ 4 s of round trips on a
+warm Mumbai database), while `/api/me` cost 21.
+
+Budget now: **`/api/bootstrap` <= 30 statements, `/api/me` <= 12,
+`/api/friends` <= 20 — and the buddy list must not grow with the buddy count**
+(+5 buddies may cost at most +6 statements).
+
+Keep it there by: resetting the per-request memo in `_begin_request()` (so
+`app_settings` is read once, not once per buddy), calling `ensure_snapshots()`
+at most once per request, batching the buddy list with `WHERE user_id IN (…)`
+(grouped summaries, one `streak_rows()` query for all buddies) and merging
+counters into `UNION ALL` queries instead of one SELECT each.
+
+Measure before merging any change to the boot path:
+
+    python3 tools/diag_boot_roundtrips.py     # budget + payload identity checks
+
+It also asserts that `/api/bootstrap`'s sub-payloads are byte-identical to the
+individual endpoints and that `friend_views_bulk()` still matches the old
+per-buddy implementation (kept in the tool as the oracle), so a "speed-up" that
+changes what the UI receives fails the run.
 
 ## ⚠️ Preview deployments share the PRODUCTION database
 
@@ -135,5 +173,63 @@ never be read back — only verified or replaced. See SECURITY.md.
 ## Security checks
 
     python3 server.py &                   # local sqlite on :8080
-    python3 tools/selftest_auth.py        # 58 HTTP-level auth/CSRF/throttle checks
+    python3 tools/selftest_auth.py        # 61 HTTP-level auth/CSRF/throttle checks
     python3 tools/selftest_migration.py   # old-schema migration + at-rest checks
+
+Browser-level checks (jsdom; the boot flow and the login form only exist in JS,
+so a Python suite cannot see them):
+
+    npm i --no-save jsdom                 # jsdom is a dev-only dependency
+    node tools/js/boot_test.js            # signed-in boot = exactly one API call
+    BOOT_MODE=fail node tools/js/boot_test.js      # legacy fallback path
+    NO_TOKEN=1 node tools/js/boot_test.js          # logged-out: warm-up + landing copy
+    node tools/js/login_form_test.js      # login POST must not wait for the wake
+    node tools/js/tour_test.js            # /tour.js defines Tour and the page is crawlable
+
+Each needs the server on :8080 (`TOUR_URL=` overrides the tour page's URL).
+The auth suite FAILS on the pre-2026-10-13 server with "stale cookie does NOT
+shadow a valid bearer token" — that is the bug it guards.
+
+## SEO / crawlers / agentic browsing
+
+    curl -s https://<host>/robots.txt      # generated per request
+    curl -s https://<host>/sitemap.xml     # generated per request
+    curl -s https://<host>/llms.txt        # brief for AI/LLM crawlers
+
+Three rules keep this working:
+
+1. **One source of truth per surface, and never a placeholder that might not
+   be substituted.** `/robots.txt`, `/sitemap.xml` and `/llms.txt` are
+   generated **per request** from the host actually serving the request
+   (`server.Handler.site_base()`; pin with `CANONICAL_HOST=jeewarroom.in` for a
+   custom domain). The two HTML pages instead carry the canonical production
+   base **literally** (`server.PROD_BASE` = `https://jee-war-room-three.vercel.app`,
+   used for canonical + Open Graph URLs). That literal is deliberate: Vercel
+   serves `public/*.html` straight from the CDN — filesystem before rewrites —
+   so those files never pass through the function in production and cannot be
+   templated per request. A `${…}` token in them would ship to real visitors
+   exactly as written. When the function *does* serve the HTML (local dev,
+   Docker, HF Spaces, custom domain), it rewrites the literal to the live host,
+   so those deployments stay self-consistent.
+   The repo previously shipped *static* robots/sitemap files pointing at
+   `https://jee-warfare.vercel.app` while production runs on
+   `https://jee-war-room-three.vercel.app` — the sitemap was advertised on a
+   host that did not exist and every listed URL belonged to a foreign domain,
+   a guaranteed way to be dropped from the index. **If the domain ever
+   changes, update `PROD_BASE` in `server.py` and the literal in the two HTML
+   files (one grep: `grep -rl jee-war-room-three.vercel.app public/`).**
+2. **A missing asset must 404, not return the app shell.** `static()` serves
+   `index.html` for extension-less paths only (client-side routes). Serving the
+   shell as `/whatever.js` makes the browser parse HTML as JavaScript and
+   reports `Uncaught SyntaxError: Unexpected token '<'`.
+3. **Bump `?v=N`** in `public/index.html` + `public/tour.html` whenever
+   `styles.css`, `app.js` or `tour.js` change: `?v=` URLs are served
+   `immutable` for a year (currently `v=24`), while the HTML shell revalidates
+   on every load via its ETag.
+
+Crawlable surface: `/` (landing copy behind the login card: features, how it
+works, FAQ — real text, not JS-rendered) and `/tour.html` (narrated tour; its
+player + audio live in `public/tour.js` so the page is ~28 KB instead of ~1 MB).
+Structured data: `WebApplication` + `WebSite` + `FAQPage` on `/`, `WebPage` +
+`BreadcrumbList` on `/tour.html`. Social/AI preview image: `public/og.png`
+(1200x630, regenerable with `python3 tools/make_og_image.py`).

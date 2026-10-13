@@ -738,3 +738,31 @@ body{overflow-y:auto;-webkit-overflow-scrolling:touch}
   .chat-pane{min-height:0}
   .msg-body{max-height:64vh;-webkit-overflow-scrolling:touch;touch-action:pan-y}
 }
+
+/* ===== v24: public landing content (SEO / agentic browsing) =====
+   Sits below the auth screen for logged-out visitors and is hidden by app.js
+   the moment the signed-in app renders. Styled in the same dark theme. */
+.landing{max-width:900px;margin:0 auto;padding:34px 20px 64px;color:var(--muted,#93a1b5);
+  border-top:1px solid var(--border,#1e2530);line-height:1.65}
+.landing h1{font-size:26px;line-height:1.25;color:var(--txt,#e8edf5);margin:0 0 14px;letter-spacing:.2px}
+.landing h2{font-size:19px;color:var(--txt,#e8edf5);margin:34px 0 12px}
+.landing h3{font-size:14px;color:var(--txt,#e8edf5);margin:0 0 6px;letter-spacing:.3px}
+.landing-lead{font-size:15px;margin:0 0 8px}
+.landing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin:22px 0 6px}
+.landing-grid article{background:var(--card,#12161d);border:1px solid var(--border,#1e2530);
+  border-radius:14px;padding:14px 16px}
+.landing-grid p{margin:0;font-size:13.5px}
+.landing-steps{margin:8px 0 10px;padding-left:20px;font-size:14px}
+.landing-steps li{margin:6px 0}
+.landing-faq{margin:8px 0 0;font-size:14px}
+.landing-faq dt{color:var(--txt,#e8edf5);font-weight:700;margin-top:14px}
+.landing-faq dd{margin:4px 0 0}
+.landing a{color:var(--accent,#ff7a1a)}
+.landing-foot{font-size:12.5px;margin-top:26px;opacity:.75}
+@media(max-width:760px){ .landing{padding:26px 16px 84px} .landing h1{font-size:21px} }
+
+/* ===== v24: tour page heading + summary (crawlable text) ===== */
+.tour-h1{font-size:20px;line-height:1.3;color:var(--txt,#e8edf5);margin:16px 0 8px;font-weight:800;letter-spacing:.2px}
+.tour-summary{font-size:13.5px;line-height:1.6;color:var(--muted,#93a1b5);margin:0 0 14px}
+.tour-summary a{color:var(--accent,#ff7a1a)}
+@media(max-width:760px){ .tour-h1{font-size:17px} }
