@@ -1,5 +1,0 @@
-User-agent: *
-Allow: /
-Allow: /tour.html
-
-Sitemap: https://jee-warfare.vercel.app/sitemap.xml

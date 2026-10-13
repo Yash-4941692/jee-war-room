@@ -63,6 +63,47 @@
     `RuntimeError`s and poisoned clients replaced. Cloud `executescript`
     strips `--` comments before splitting (a `;` inside the recovery_codes
     comment used to break the DDL with "incomplete input").
+- **Auth robustness (2026-10-13) — the "Not authenticated" bug:** `_auth()`
+  tried the session COOKIE first and returned None if that session was gone,
+  without ever checking the `Authorization: Bearer …` token the client sends in
+  parallel. Any stale cookie (an older deployment's session, a session revoked
+  on another device, a cookie left on the domain by a preview URL) therefore
+  produced a random 401 — and app.js clears the stored token on a 401, so one
+  bad cookie signed the user out permanently. Both credentials are now tried
+  (`_auth_row()` per candidate); regression checks live in
+  `tools/selftest_auth.py` ("stale cookie does NOT shadow a valid bearer
+  token", "stale token does NOT shadow a valid session cookie", "a cookie-only
+  stale session is still rejected") — the first one FAILS against the previous
+  code, which is exactly what production was doing.
+- **Cold-start / warmth (2026-10-13):** `.github/workflows/keepalive.yml` was
+  **missing from the repo** even though DEPLOY.md/STATUS.md referenced it, so
+  nothing kept the free-tier Turso database awake: the login POST was the first
+  DB contact for a returning visitor and paid the ~15-20 s wake. Restored
+  (twice an hour; ~1440 of 2000 free Actions minutes/month). The client also
+  stopped *blocking* on `/healthz` before submitting the login form — the wake
+  now starts at page load in the background (`warmUpServer()` fire-and-forget),
+  so it overlaps with the user typing. A transient boot failure now shows a
+  retry screen (with the session intact) instead of dumping the user on the
+  login screen; only a real 401 clears the token.
+- **SEO / discoverability (2026-10-13):** `robots.txt` and `sitemap.xml` were
+  static files hard-coding **the wrong domain** (`jee-warfare.vercel.app`; the
+  app runs on `jee-war-room-three.vercel.app`) — the sitemap was advertised on
+  a host that does not exist and every URL in it belonged to another domain.
+  They are now generated per request from the serving host (`site_base()`,
+  override with `CANONICAL_HOST`), and `/llms.txt` was added for AI/agentic
+  crawlers. The HTML pages carry the production base literally (`PROD_BASE`,
+  `server.py`) rather than a placeholder, because Vercel's CDN serves
+  `public/*.html` itself (filesystem before rewrites) and would otherwise ship
+  an unsubstituted token to real visitors. `/` gained a crawlable landing block (features, how it works, FAQ)
+  behind the login card, real meta description + canonical + Open Graph +
+  Twitter tags, `WebApplication`/`WebSite`/`FAQPage` JSON-LD and an
+  `og.png` preview card (1200x630, `tools/make_og_image.py`). `/tour.html` got
+  the same meta treatment plus `WebPage`/`BreadcrumbList` JSON-LD, and its
+  ~1 MB inline player+audio script moved to `public/tour.js` so the page itself
+  is ~28 KB (the player is cached as an immutable `?v=` asset instead of being
+  re-downloaded with the HTML on every visit). Missing assets now 404 instead
+  of returning the HTML shell. See DEPLOY.md → "SEO / crawlers / agentic
+  browsing" for the three rules that keep this correct.
 - **First-load budget (HARD CONSTRAINT, 2026-10-13):** the whole first screen
   (me + friends + announcements + chapters) is ONE request —
   `GET /api/bootstrap` — at **<= 30 SQL statements**; `GET /api/me` <= 12 and

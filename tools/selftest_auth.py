@@ -218,6 +218,23 @@ def main():
     check("cross-site cookie POST blocked (bad Origin)", st == 403, d)
     st, d, _ = req("POST", "/api/me", {"name": name}, cookie=ck, origin=origin_self)
     check("same-origin cookie POST allowed", st == 200, d)
+
+    # --------------------------------- 7b. cookie must not SHADOW the token
+    # The app sends BOTH a session cookie and an Authorization: Bearer token
+    # (it keeps the token in localStorage so it survives third-party-cookie
+    # blocking). `_auth()` used to try the cookie first and, if that session was
+    # gone, return None without ever checking the token the client also sent —
+    # so a stale cookie produced random "Not authenticated" errors, and because
+    # app.js clears the stored token on a 401, one bad cookie signed the user out
+    # for good. Both credentials must now be tried.
+    st, d, _ = req("GET", "/api/me", token=token, cookie="jwr_sess=stale-session-from-an-old-deploy")
+    check("stale cookie does NOT shadow a valid bearer token",
+          st == 200 and (d.get("user") or {}).get("name") == name, (st, d))
+    st, d, _ = req("GET", "/api/me", token="not-a-real-token", cookie=ck)
+    check("stale token does NOT shadow a valid session cookie",
+          st == 200 and (d.get("user") or {}).get("name") == name, (st, d))
+    st, d, _ = req("GET", "/api/me", cookie="jwr_sess=stale-session-from-an-old-deploy")
+    check("a cookie-only stale session is still rejected", st == 401, (st, d))
     st, d, _ = req("POST", "/api/me", {"name": name}, cookie=ck)
     check("cookie POST with no Origin/Referer refused", st == 403, d)
     st, d, _ = req("POST", "/api/me", {"name": "hacked2"}, cookie=ck, ctype="text/plain",

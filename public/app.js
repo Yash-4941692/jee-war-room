@@ -70,17 +70,23 @@ async function api(path, body){
       if(tries<3 && (isGet || tries<=2)){ await new Promise(res=>setTimeout(res, tries*1200)); continue; }
       bumpFails();
       if(consecutiveFails()>=2) setOffline(true);
-      throw new Error(e.name==="TimeoutError" ? "Server is warming up — please retry in a few seconds."
-                                              : "No connection — the server is temporarily unreachable.");
+      const ne = new Error(e.name==="TimeoutError" ? "Server is warming up — please retry in a few seconds."
+                                                   : "No connection — the server is temporarily unreachable.");
+      ne.status = 0;    // network/timeout, NOT a rejected session
+      throw ne;
     }
   }
   try{ d = await r.json(); }catch(e){}
   resetFails(); setOffline(false);
+  // Errors carry `.status` so callers can tell "this session is gone" (401 —
+  // clear the token) from "the server is having a moment" (5xx/timeout — keep
+  // the token and offer a retry instead of silently signing the user out).
+  const fail = (msg, status) => { const e = new Error(msg); e.status = status; return e; };
   if(r.status === 401 && !path.includes("/auth/")){
     setToken(""); state.me = null; showAuth();
-    throw new Error(d.error || "Please log in again.");
+    throw fail(d.error || "Please log in again.", 401);
   }
-  if(!r.ok){ throw new Error(d.error || ("Request failed ("+r.status+")")); }
+  if(!r.ok){ throw fail(d.error || ("Request failed ("+r.status+")"), r.status); }
   return d;
 }
 /* connectivity banner — only after repeated real failures, never a single blip */
@@ -217,6 +223,11 @@ async function loadBootLegacy(){
 
 async function init(){
   if(!getToken()){
+    // Logged out: start the (potentially expensive) database wake NOW, in the
+    // background, so it overlaps with the user typing their password instead of
+    // blocking the login POST. A signed-in visitor does not need this — their
+    // bootstrap request touches the database anyway.
+    fire(warmUpServer);
     showAuth();
     return;
   }
@@ -224,25 +235,53 @@ async function init(){
     try{ await loadBootstrap(); }
     catch(e){ await loadBootLegacy(); }
     enterApp();
-  }catch(e){ showAuth(); }
+  }catch(e){
+    // A rejected session (401) really does mean "log in again". Anything else —
+    // a cold database, a 500 from a waking worker, a dropped connection — must
+    // NOT dump the user on the login screen with their session still valid:
+    // show a retry screen instead, and keep the stored token.
+    if(e && e.status === 401) return showAuth();
+    bootFailed(e);
+  }
 }
-/* A sleeping free-tier database takes ~15-20 s to wake. The public health
-   endpoint itself triggers the wake, so we warm it ONCE up front instead of
-   letting the login/app burst collide with the wake (that collision caused
-   the cascading 500s / slow loads). */
-async function warmUpServer(){
-  if(state.warm) return true;
-  for(let i=0;i<2;i++){
+function bootFailed(err){
+  const b = $("#boot"); if(!b) return showAuth();
+  b.classList.remove("hidden");
+  $("#auth").classList.add("hidden"); $("#app").classList.add("hidden");
+  const txt = b.querySelector(".boot-txt");
+  if(txt) txt.textContent = "COULDN'T REACH THE SERVER";
+  if(b.querySelector(".boot-retry")) return;
+  const extra = document.createElement("div");
+  extra.className = "boot-retry";
+  extra.innerHTML = `<div class="muted" style="font-size:13px;margin-top:8px;text-align:center;max-width:330px">${
+    esc((err && err.message) || "The server is waking up.")}</div>
+    <button class="btn-primary" id="boot-retry-btn" style="margin-top:14px">TRY AGAIN</button>
+    <button class="btn-ghost" id="boot-signin-btn" style="margin-top:8px">SIGN IN AGAIN</button>`;
+  b.appendChild(extra);
+  extra.querySelector("#boot-retry-btn").onclick = ()=>{ location.reload(); };
+  extra.querySelector("#boot-signin-btn").onclick = ()=>{ setToken(""); state.me=null; showAuth(); };
+}
+/* A sleeping free-tier database takes ~15-20 s to answer its first query, and
+   the login POST is usually the first thing that touches it. This warms the
+   connection in the BACKGROUND (fire-and-forget, kicked off at page load) — it
+   used to be awaited immediately before the login request, which added a
+   blocking round trip to every sign-in instead of hiding the wake behind the
+   user typing. */
+function warmUpServer(){
+  if(state.warm) return Promise.resolve(true);
+  if(state.warming) return state.warming;      // one warm-up at a time
+  state.warming = (async()=>{
     try{
       const ctrl=new AbortController();
-      const to=setTimeout(()=>ctrl.abort(),15000);
-      const r=await fetch("/healthz?detail=1",{signal:ctrl.signal,cache:"no-store"});
+      const to=setTimeout(()=>ctrl.abort(),20000);
+      const r=await fetch("/healthz",{signal:ctrl.signal,cache:"no-store"});
       clearTimeout(to);
       if(r.ok){ state.warm=true; return true; }
-    }catch(e){ /* waking; one more attempt */ }
-    await new Promise(res=>setTimeout(res,1000));
-  }
-  return false; // let normal calls proceed; they have their own retries
+    }catch(e){ /* still waking — real requests carry their own retries */ }
+    state.warming=null;                        // allow another attempt later
+    return false;
+  })();
+  return state.warming;
 }
 function showAuth(){
   $("#boot").classList.add("hidden"); $("#app").classList.add("hidden"); $("#auth").classList.remove("hidden");
@@ -305,7 +344,8 @@ async function submitResetPassword(){
   const btn = $("#rp-submit-btn");
   if(btn){ btn.disabled = true; btn.textContent = "RESETTING…"; }
   try{
-    await warmUpServer();
+    // No blocking warm-up here any more: init() already started the database
+    // wake in the background when the page loaded.
     const r = await api("/api/auth/reset-password", { name, recoveryCode: code, newPassword: pass });
     if(r.token) setToken(r.token);
     closeModal();
@@ -419,10 +459,11 @@ async function authSubmit(ev){
   ev.preventDefault();
   const name=$("#auth-name").value.trim(), pw=$("#auth-pass").value;
   const btn=$("#auth-btn"); btn.disabled=true; $("#auth-err").textContent="";
-  const oldBtn=btn.textContent; btn.textContent="WARMING UP…";
   try{
-    await warmUpServer();
-    btn.textContent=oldBtn;
+    // The warm-up already started at page load (init) — do NOT await it here:
+    // blocking the login POST behind it added a whole round trip to every
+    // sign-in. (The button label is no longer swapped to "WARMING UP…", so
+    // there is nothing to restore either.)
     if(state.authMode==="signup"){
       const examDate=$("#auth-date").value || undefined;
       const r = await api("/api/auth/signup",{name,password:pw,examDate});
@@ -463,6 +504,9 @@ async function enterApp(){
   $("#boot").classList.add("hidden"); $("#auth").classList.add("hidden");
   $("#auth-form").classList.remove("hidden"); $("#auth-after").classList.add("hidden");
   $("#app").classList.remove("hidden");
+  // the crawlable landing copy exists for logged-out visitors — inside the app
+  // it is noise (it is also what app.js hides for a signed-in reload)
+  const landing = $("#landing"); if(landing) landing.classList.add("hidden");
   if(!location.hash || location.hash==="#/") location.hash="#/home";
   route();
   startLiveSync();

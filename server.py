@@ -36,6 +36,15 @@ import syllabus as SYL
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(BASE, "public")
+# Canonical production base, written literally into the two HTML pages
+# (canonical + Open Graph URLs). Vercel serves public/*.html straight from its
+# CDN — filesystem before rewrites — so the pages never pass through this
+# function in production and cannot be templated per request. When this function
+# DOES serve them (local, Docker, custom domain) the literal is rewritten to the
+# live host, so a non-Vercel deployment stays self-consistent.
+# Change this in ONE place if the production domain ever changes (and see
+# DEPLOY.md -> "SEO / crawlers / agentic browsing").
+PROD_BASE = os.environ.get("CANONICAL_HOST_BASE") or "https://jee-war-room-three.vercel.app"
 DB_PATH = os.path.join(BASE, "data", "warroom.db")
 try:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -1173,31 +1182,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             FROM sessions s JOIN users u ON u.id=s.user_id
                            WHERE s.token=?"""
 
-    def _auth(self):
-        token = self._cookie_token() or self._bearer_token()
-        if not token: return None
+    def _auth_row(self, c, token):
+        """The session row for ONE token, or None. (Schema-tolerant: see _auth.)"""
         digest = authsec.hash_token(token)
+        if _AUTH_COLS_FULL[0] is False:
+            r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
+        else:
+            try:
+                r = c.execute(self._AUTH_SQL_FULL, (digest, time.time())).fetchone()
+                _AUTH_COLS_FULL[0] = True
+            except Exception as e:
+                # CRITICAL: only a PROVABLY missing column/table degrades to
+                # the legacy shape. A transient DB failure must re-raise and
+                # become a 500 — returning None here would send a 401, and
+                # app.js clears the stored token on 401, silently signing
+                # out every user on a passing Turso blip. Degrade, don't deny.
+                if _AUTH_COLS_FULL[0] is True or not _missing_schema(e):
+                    raise
+                _AUTH_COLS_FULL[0] = False
+                r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
+        return dict(r) if r else None
+
+    def _auth(self):
+        """Authenticate the request against EVERY credential it presented.
+
+        The cookie used to SHADOW the bearer token: `cookie or bearer` tried the
+        cookie first and, if that session was gone, returned None without ever
+        looking at the perfectly valid `Authorization: Bearer …` the app also
+        sends. A stale cookie (an earlier deployment's session, a session
+        revoked elsewhere, a cookie left by a preview URL on the same registrable
+        domain) therefore produced random "Not authenticated" errors — and
+        app.js clears the stored token on a 401, so one bad cookie silently
+        signed the user out for good. Both credentials are tried now.
+        """
+        tokens = []
+        for t in (self._cookie_token(), self._bearer_token()):
+            if t and t not in tokens:
+                tokens.append(t)
+        if not tokens: return None
         c = db()
         try:
-            if _AUTH_COLS_FULL[0] is False:
-                r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
-            else:
-                try:
-                    r = c.execute(self._AUTH_SQL_FULL, (digest, time.time())).fetchone()
-                    _AUTH_COLS_FULL[0] = True
-                except Exception as e:
-                    # CRITICAL: only a PROVABLY missing column/table degrades to
-                    # the legacy shape. A transient DB failure must re-raise and
-                    # become a 500 — returning None here would send a 401, and
-                    # app.js clears the stored token on 401, silently signing
-                    # out every user on a passing Turso blip. Degrade, don't deny.
-                    if _AUTH_COLS_FULL[0] is True or not _missing_schema(e):
-                        raise
-                    _AUTH_COLS_FULL[0] = False
-                    r = c.execute(self._AUTH_SQL_LEGACY, (digest,)).fetchone()
+            for t in tokens:
+                r = self._auth_row(c, t)
+                if r: return r
         finally:
             c.close()
-        return dict(r) if r else None
+        return None
 
     def _nonce_ok(self, c, uid, body):
         nonce = (body or {}).get("nonce")
@@ -1340,18 +1370,150 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._err("Not found", 404)
 
     # -------- static
+    # -------- SEO endpoints (generated per request — see site_base)
+    def site_base(self):
+        """Absolute base URL of the host actually serving this request.
+
+        Used for canonical/OG URLs, sitemap.xml and robots.txt. It MUST be
+        derived from the live request: the repo previously shipped static files
+        hard-coding `https://jee-warfare.vercel.app` while production runs on
+        `https://jee-war-room-three.vercel.app`, so robots.txt advertised a
+        sitemap on a host that does not exist and every sitemap URL pointed at
+        the wrong domain. Set CANONICAL_HOST to pin it explicitly (custom domain).
+        """
+        host = (os.environ.get("CANONICAL_HOST") or "").strip()
+        if not host:
+            for h in (self.headers.get("X-Forwarded-Host"), self.headers.get("Host")):
+                host = (h or "").split(",")[0].strip()
+                if host: break
+        host = (host or "").split("/")[0].strip()
+        if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]]+", host):
+            return ""
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        if proto not in ("http", "https"):
+            proto = "http" if host.split(":")[0] in ("localhost", "127.0.0.1", "0.0.0.0") else "https"
+        return "%s://%s" % (proto, host)
+
+    @staticmethod
+    def _page_lastmod(name):
+        try:
+            return date.fromtimestamp(os.path.getmtime(os.path.join(STATIC, name))).isoformat()
+        except OSError:
+            return TODAY()
+
+    def _robots_txt(self, base):
+        out = ("# JEE WAR ROOM — robots.txt\n"
+               "User-agent: *\n"
+               "Allow: /\n"
+               "\n"
+               "# Private study data lives behind the login wall; the public pages\n"
+               "# (/ and /tour.html) are the only crawlable ones. AI/LLM crawlers are\n"
+               "# welcome — we publish /llms.txt for them.\n"
+               "Disallow: /api/\n"
+               "Disallow: /healthz\n")
+        if base:      # a relative Sitemap: line is invalid, so omit it entirely
+            out += "\nSitemap: %s/sitemap.xml\n" % base
+        return out
+
+    def _sitemap_xml(self, base):
+        pages = (("/", "index.html", "1.0", "daily"),
+                 ("/tour.html", "tour.html", "0.8", "weekly"))
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+        for path, fn, prio, freq in pages:
+            out.append("  <url>\n    <loc>%s%s</loc>\n    <lastmod>%s</lastmod>\n"
+                       "    <changefreq>%s</changefreq>\n    <priority>%s</priority>\n  </url>"
+                       % (base, path, self._page_lastmod(fn), freq, prio))
+        out.append("</urlset>")
+        return "\n".join(out) + "\n"
+
+    def _llms_txt(self, base):
+        """Brief for AI/agentic crawlers that read /llms.txt (the emerging
+        companion to robots.txt): what this site is, and where the real pages are."""
+        return (
+            "# JEE WAR ROOM\n"
+            "\n"
+            "> Free, ad-free web app for Indian JEE (Main/Advanced) aspirants who study in pairs: "
+            "log daily study activity (lectures, revision, DPPs, PYQs, homework, focus sessions, "
+            "mock tests, mistakes), track syllabus progress chapter by chapter, keep a daily streak, "
+            "compare progress with a study buddy, and watch a deterministic projected-AIR estimate move.\n"
+            "\n"
+            "The app itself is behind a login (accounts are private), so the crawlable pages are:\n"
+            "\n"
+            "## Public pages\n"
+            "- [Home / sign in](%s/): what the tracker does, plus the login form.\n"
+            "- [Explainer video tour](%s/tour.html): a narrated walkthrough of every feature.\n"
+            "\n"
+            "## What the app tracks (feature summary)\n"
+            "- Activity log: lectures, revision, DPPs, previous-year questions, homework, custom metrics.\n"
+            "- Focus timer with pause/resume; distraction logging with categories.\n"
+            "- Targets: daily goals with done/partial/missed status and an execution percentage.\n"
+            "- Syllabus: the full JEE Main chapter list per subject, with status and lecture counts.\n"
+            "- Mocks: score, subject split, accuracy, and a score trend.\n"
+            "- Mistakes notebook: error type + question number, grouped by pattern.\n"
+            "- Projected AIR: a transparent, deterministic prep-score -> AIR estimate, explicitly labelled an estimate, not a rank prediction.\n"
+            "- Streak, XP and levels; buddy comparison (only blocks the user opts to share).\n"
+            "\n"
+            "## Facts\n"
+            "- Cost: free, no ads, no social feed, no tracking pixels from third parties.\n"
+            "- Accounts are private and require signup; passwords use PBKDF2-HMAC-SHA256 (120k iterations).\n"
+            "- Data is stored server-side in a libSQL (Turso) database, not in the browser.\n"
+            "- Not affiliated with NTA, JEE, or any coaching institute; no rank guarantee is made.\n"
+            % (base, base))
+
+    # Extensions that are never a client-side route: a miss must be a 404, not
+    # the SPA shell. Anything else (extension-less) keeps the shell fallback.
+    _ASSET_EXT = frozenset(("js", "css", "json", "xml", "txt", "png", "jpg", "jpeg", "gif", "webp",
+                            "svg", "ico", "mp3", "mp4", "webm", "woff", "woff2", "ttf", "map",
+                            "webmanifest", "wasm", "pdf", "zip"))
     # Files worth compressing when this server is the edge (Docker / HF Spaces /
     # local). On Vercel the CDN already compresses and serves public/ itself.
-    _TEXT_EXT = frozenset(("html", "js", "css", "json", "svg", "xml", "txt", "webmanifest"))
+    _TEXT_EXT = frozenset(("html", "js", "css", "json", "svg", "xml", "txt", "md", "webmanifest"))
     # gzip result cache: keyed by (path, mtime, size) so a rebuild invalidates it.
     _gzip_cache = {}
 
+    def _not_found(self, p):
+        """Plain 404 for a missing asset (see static()). Never the SPA shell."""
+        body = b"Not found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Robots-Tag", "noindex")
+        for k, v in self._security_headers(): self.send_header(k, v)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def static(self, p, q=None):
         if p == "/": p = "/index.html"
+        base = self.site_base()
+        # Generated per request so canonical/sitemap/robots always match the host
+        # actually serving the page (see site_base for why that matters).
+        virtual = {"/robots.txt": ("text/plain; charset=utf-8", self._robots_txt(base)),
+                   "/sitemap.xml": ("application/xml; charset=utf-8", self._sitemap_xml(base)),
+                   "/llms.txt": ("text/plain; charset=utf-8", self._llms_txt(base))}
+        if p in virtual:
+            ctype, text = virtual[p]
+            data = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in self._security_headers(): self.send_header(k, v)
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers(); self.wfile.write(data)
+            return
         fn = os.path.normpath(os.path.join(STATIC, p.lstrip("/")))
         # compare against STATIC + separator: a bare startswith() also accepts
         # sibling directories like ".../jee-war-room-secrets/x"
         if not fn.startswith(STATIC + os.sep) or not os.path.isfile(fn):
+            # A missing ASSET must 404, not fall back to the HTML shell: serving
+            # index.html as /something.js makes the browser parse HTML as
+            # JavaScript ("Uncaught SyntaxError: Unexpected token '<'") and
+            # turns every missing image/script into a soft-404 for crawlers.
+            leaf = p.rsplit("/", 1)[-1]
+            ext_req = leaf.rsplit(".", 1)[-1].lower() if "." in leaf else ""
+            if ext_req in self._ASSET_EXT:
+                return self._not_found(p)
             fn = os.path.join(STATIC, "index.html")
         ext = fn.rsplit(".", 1)[-1].lower()
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
@@ -1361,9 +1523,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(fn, "rb") as f: data = f.read()
         st = os.stat(fn)
         compressible = ext in self._TEXT_EXT
+        # The HTML files carry the canonical production base (PROD_BASE)
+        # literally. On a host that routes pages through this function (local
+        # dev, Docker, HF Spaces, a custom domain) rewrite it to the host that
+        # actually answered, so canonical/OG URLs are never stale. On Vercel the
+        # CDN serves the HTML itself (filesystem before rewrites), so the file's
+        # own value is used there — which is the production base, exactly right.
+        # This is why the HTML does NOT use a placeholder token: a token that
+        # never gets substituted is infinitely worse than a correct literal.
+        host_variant = ""
+        if ext == "html" and base and base != PROD_BASE and PROD_BASE in data.decode("utf-8", "ignore"):
+            host_variant = base
+            data = data.replace(PROD_BASE.encode(), base.encode())
         # Weak ETag from mtime+size: repeat visits answer 304 instead of
-        # re-sending app.js (145 KB) / styles.css (47 KB) / tour.html (1 MB).
-        etag = 'W/"%x-%x"' % (int(st.st_mtime), st.st_size)
+        # re-sending app.js (145 KB) / styles.css (47 KB) / tour.js (971 KB).
+        etag = 'W/"%x-%x%s"' % (int(st.st_mtime), st.st_size,
+                                ("-" + hashlib.sha1(host_variant.encode()).hexdigest()[:8]) if host_variant else "")
         if (self.headers.get("If-None-Match") or "").strip() == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
@@ -1375,7 +1550,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = data
         encoding = None
         if compressible and len(data) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
-            key = (fn, int(st.st_mtime), st.st_size)
+            key = (fn, int(st.st_mtime), st.st_size, host_variant)
             cached = Handler._gzip_cache.get(key)
             if cached is None:
                 import gzip as _gzip
