@@ -224,12 +224,41 @@ Three rules keep this working:
    reports `Uncaught SyntaxError: Unexpected token '<'`.
 3. **Bump `?v=N`** in `public/index.html` + `public/tour.html` whenever
    `styles.css`, `app.js` or `tour.js` change: `?v=` URLs are served
-   `immutable` for a year (currently `v=24`), while the HTML shell revalidates
-   on every load via its ETag.
+   `immutable` for a year (currently `v=26` for `app.js`, `v=25` for
+   `styles.css`/`tour.js`), while the HTML shell revalidates on every load via
+   its ETag. Bump only the files you changed, and bump the `rel="preload"` URL
+   with the `<script src>` — `tools/js/boot_test.js` fails if they disagree.
+4. **Ship real icon files, never a data URI.** `rel="icon"` must point at a
+   crawlable URL: an inline `data:` SVG has no URL, so an installed app cannot
+   use it, iOS has nothing for the home screen, and Google Search needs a
+   square icon at a multiple of 48px (`/favicon-96x96.png`) — without one it
+   shows a generic globe. Everything is generated deterministically by
+   `python3 tools/make_icons.py` (Pillow; build-time only, not a runtime
+   dependency) and referenced from both HTML files: `/favicon.ico` (16+32+48),
+   `/icon.svg`, `/favicon-96x96.png`, `/apple-touch-icon.png`,
+   `/manifest.webmanifest`.
+5. **Installability lives in the manifest + an inert service worker.**
+   `/manifest.webmanifest` declares `standalone`, `start_url: /`, theme
+   `#0a0d13` and 192px/512px PNGs (`any` + `maskable`) — Chromium refuses to
+   install without those. `public/sw.js` is registered by `app.js` and caches
+   NOTHING (no `respondWith` call): Chrome requires a service worker with a
+   `fetch` handler before it offers the real install flow, but caching must stay
+   the server's job, or users see stale HTML or stale study data after a
+   deploy. `vercel.json` pins `Content-Type: application/manifest+json` for the
+   manifest and `no-cache` for `sw.js`; `server.py`'s static handler does the
+   same for Docker / HF Spaces / the tunnel. Verify with
+   `node tools/js/icons_test.js` (server on :8080, no npm deps).
 
 Crawlable surface: `/` (landing copy behind the login card: features, how it
 works, FAQ — real text, not JS-rendered) and `/tour.html` (narrated tour; its
 player + audio live in `public/tour.js` so the page is ~28 KB instead of ~1 MB).
 Structured data: `WebApplication` + `WebSite` + `FAQPage` on `/`, `WebPage` +
 `BreadcrumbList` on `/tour.html`. Social/AI preview image: `public/og.png`
-(1200x630, regenerable with `python3 tools/make_og_image.py`).
+(1200x630, regenerable with `python3 tools/make_og_image.py`). App icon (tab,
+taskbar, home screen, Android launcher, search result): `public/favicon.ico`,
+`public/icon.svg`, `public/favicon-96x96.png`, `public/icon-192.png`,
+`public/icon-512.png`, `public/icon-maskable-*.png`,
+`public/apple-touch-icon.png` — all regenerable with
+`python3 tools/make_icons.py`. After deploying an icon change, a browser or
+phone only picks the new icon up on a fresh install (re-add to home screen) and
+Google re-reads favicons on its own crawl schedule — days to weeks.

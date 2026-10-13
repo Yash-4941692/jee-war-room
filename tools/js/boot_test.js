@@ -10,7 +10,7 @@
    Asserts: first load makes exactly one API call (/api/bootstrap), the home
    screen renders, 8 nav tabs, no console errors, the crawlable landing block
    is hidden inside the app (and the meta/canonical/JSON-LD survive), and the
-   versioned asset URLs are 25.
+   versioned asset URLs in index.html agree with each other (preload == script).
 */
 /* Boot-flow integration test: run the real public/app.js in jsdom with a
    stubbed fetch and assert that the first load is ONE request
@@ -97,7 +97,7 @@ if(!process.env.NO_TOKEN) window.localStorage.setItem("jwr_token", "TESTTOKEN");
 // the page's own scripts (analytics/speed-insights) reference these
 window.requestIdleCallback = cb => setTimeout(cb, 0);
 
-// run app.js exactly like the <script src="/app.js?v=24"> tag would
+// run app.js exactly like the <script src="/app.js?v=..."> tag would
 window.eval(appjs);
 
 setTimeout(() => {
