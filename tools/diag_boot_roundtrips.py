@@ -186,8 +186,8 @@ def seed_owner_and_buddies():
                                              "streak": True, "xp": True, "score": True, "air": True,
                                              "mocks": True, "distractions": True}})))
 
-    # boot_full: 3 consecutive active days ending today
-    for back in (0, 1, 2):
+    # boot_full: 4-day past streak (10..13 days ago) + 3 consecutive active days ending today
+    for back in (0, 1, 2, 10, 11, 12, 13):
         d = day_f(today - server.timedelta(days=back))
         c.execute("""INSERT INTO activities(user_id,type,custom_key,subject,chapter,amount,duration,
                                             extra,note,day,created_at)
@@ -356,6 +356,7 @@ def main():
             ("boot_full summary mocks", full_v.get("summary", {}).get("mocks"), 1),
             ("boot_full summary errors", full_v.get("summary", {}).get("errors"), 1),
             ("boot_full streak", full_v.get("streak", {}).get("current"), 3),
+            ("boot_full best streak", full_v.get("streak", {}).get("best"), 4),
             ("boot_full xp level", full_v.get("xp", {}).get("level"), 4),
             ("boot_full air", full_v.get("air"), 300000),
             ("boot_full unread", full_v.get("unread"), 2),

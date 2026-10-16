@@ -835,7 +835,7 @@ def level_info(xp):
 def xp_total(c, uid):
     return c.execute("SELECT COALESCE(SUM(amount),0) v FROM xp_events WHERE user_id=?", (uid,)).fetchone()["v"]
 
-def streak_rows(c, uids, since):
+def streak_rows(c, uids, since="0000-01-01"):
     """ONE round trip for the streak inputs of N users.
 
     Used to be three separate SELECTs per user (activities, mocks, targets),
@@ -860,9 +860,9 @@ def streak_rows(c, uids, since):
 
 
 def streak_from_rows(rows, s, today_dt=None):
-    """Consecutive active study days (ending today or yesterday) from
-    streak_rows() output. A day counts if the student logged study activities,
-    focus sessions, mocks, or completed enough targets."""
+    """Consecutive active study days (ending today or yesterday) and all-time
+    best streak from streak_rows() output. A day counts if the student logged
+    study activities, focus sessions, mocks, or completed enough targets."""
     thr = s.get("streakThreshold", 70) / 100.0
     active_days = set()
     t_days = defaultdict(lambda: [0, 0.0])
@@ -898,15 +898,30 @@ def streak_from_rows(rows, s, today_dt=None):
         streak += 1
         cur -= timedelta(days=1)
 
-    best = max(s.get("bestStreak", 0), streak)
+    longest = 0
+    run = 0
+    prev_d = None
+    for ds in sorted(active_days):
+        try:
+            d = date.fromisoformat(ds)
+        except Exception:
+            continue
+        if prev_d is not None and (d - prev_d).days == 1:
+            run += 1
+        else:
+            run = 1
+        if run > longest:
+            longest = run
+        prev_d = d
+
+    best = max(s.get("bestStreak", 0), streak, longest)
     if best != s.get("bestStreak", 0):
         s["bestStreak"] = best
     return {"current": streak, "best": best}
 
 
 def streak_info(c, uid, s):
-    since = DAY_F(datetime.now(IST).date() - timedelta(days=120))
-    return streak_from_rows(streak_rows(c, [uid], since).get(uid, []), s)
+    return streak_from_rows(streak_rows(c, [uid]).get(uid, []), s)
 
 def sweep_targets(c, uid, s):
     """Once per day: mark leftover old open targets as missed, apply XP penalty."""
@@ -1697,9 +1712,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             u["role"] = r["role"] if r else None
         # created_at is already in the auth row — pass it instead of re-reading
         ensure_snapshots(c, uid, s, created_at=u.get("created_at"))
+        prev_best = s.get("bestStreak", 0)
+        st = streak_info(c, uid, s)
+        if s.get("bestStreak", 0) > prev_best:
+            save_settings(c, uid, s)
+            c.commit()
         return {"user": u, "settings": s, "global": admin_settings(c),
                 "summary": today_summary(c, uid, s),
-                "xp": level_info(xp_total(c, uid)), "streak": streak_info(c, uid, s),
+                "xp": level_info(xp_total(c, uid)), "streak": st,
                 "air": self._air(c, uid, s)}
 
     def chapters_payload(self, c, uid):
@@ -1804,7 +1824,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ---- streak / xp / air / mocks / distraction blocks (one each)
         need_streak = [pid for pid, m in metas.items() if m["streak"]]
         if need_streak:
-            srows = streak_rows(c, need_streak, since)
+            srows = streak_rows(c, need_streak)
             for pid in need_streak:
                 metas[pid]["streak_val"] = streak_from_rows(srows.get(pid, []), metas[pid]["ps"], today_d)
         need_xp = [pid for pid, m in metas.items() if m["xp"]]
@@ -2724,6 +2744,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
              now_iso()))
         add_xp(c, uid, gained, reason, "activity", cur.lastrowid, s, commit=False)
         ensure_snapshots(c, uid, s, force_today=True)
+        streak_info(c, uid, s)
         save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid, "xpGained": gained}
         self._nonce_save(c, uid, nonce, result)
@@ -2799,7 +2820,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if f == "subject" and v and v not in SUBJECTS: v = ""
                 if f == "chapter" and v and v not in chapter_names(c, uid): v = ""
                 c.execute(f"UPDATE targets SET {f}=? WHERE id=?", (v, tid))
-        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); streak_info(c, uid, s); save_settings(c, uid, s); c.commit()
         return self._send({"ok": True})
 
     def dup_target(self, c, uid, tid, body):
@@ -2846,6 +2867,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     s = get_settings(c, uid)
                     add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
                     ensure_snapshots(c, uid, s, force_today=True)
+                    streak_info(c, uid, s)
                     save_settings(c, uid, s)
         if "name" in body:
             nm = (body["name"] or "").strip()[:80]
@@ -2875,6 +2897,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     s = get_settings(c, uid)
                     add_xp(c, uid, 50, f"Completed chapter: {r['name']}", "chapter", cid, s, commit=False)
                     ensure_snapshots(c, uid, s, force_today=True)
+                    streak_info(c, uid, s)
                     save_settings(c, uid, s)
                 elif done > 0 and r["status"] == "not_started":
                     c.execute("UPDATE chapters SET status='in_progress' WHERE id=?", (cid,))
@@ -2942,7 +2965,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             VALUES(?,?,?,?,?,0,0,?,?,?,?)""",
             (uid, "mock", None, "", "", tt, f"{tt} ({day})", day, ts))
         add_xp(c, uid, s["xp"]["mock"], "Mock test", "mock", cur.lastrowid, s, commit=False)
-        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); streak_info(c, uid, s); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)
@@ -2964,7 +2987,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         c.execute("INSERT INTO activities(user_id,type,subject,chapter,amount,duration,extra,note,day,created_at) VALUES(?,?,?,?,0,0,?,?,?,?)",
                   (uid, "error", subj, chap, et, (body.get("note") or "")[:300], day, now_iso()))
         add_xp(c, uid, s["xp"]["error"], "Error analysis", "error", cur.lastrowid, s, commit=False)
-        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); streak_info(c, uid, s); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "id": cur.lastrowid}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)
@@ -3012,7 +3035,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         touch_chapter(c, uid, r["subject"], r["chapter"])
         c.execute("UPDATE timers SET logged=1,running=?,ended_at=? WHERE id=?",
                   (running, now_iso(), tid))
-        ensure_snapshots(c, uid, s, force_today=True); save_settings(c, uid, s); c.commit()
+        ensure_snapshots(c, uid, s, force_today=True); streak_info(c, uid, s); save_settings(c, uid, s); c.commit()
         result = {"ok": True, "minutes": mins, "xpGained": gained}
         self._nonce_save(c, uid, body.get("nonce"), result); c.commit()
         return self._send(result)
