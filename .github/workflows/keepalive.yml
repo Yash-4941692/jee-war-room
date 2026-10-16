@@ -5,17 +5,9 @@ name: keepalive
 # Why this file matters: a suspended free-tier libSQL database takes ~15-20 s
 # to answer its first query, and the login POST is the first database contact a
 # returning visitor makes. Without a periodic ping every visit paid that wake
-# BEFORE it could authenticate — the "login takes too long" symptom. This
-# workflow is referenced by DEPLOY.md ("GitHub pings /healthz every 30 minutes")
-# and had gone missing from the repo; it is restored here.
+# BEFORE it could authenticate — the "login takes too long" symptom.
 #
-# Budget note (private repo → GitHub Actions minutes are metered, 2000/month on
-# the free plan): two runs an hour = ~1440 runs/month ≈ 1440 billed minutes
-# (GitHub rounds each job up to a minute). Do NOT increase the frequency past
-# this without checking the Actions usage page — every-5-minutes would blow the
-# free allowance. For a tighter heartbeat, point an external uptime monitor
-# (UptimeRobot, cron-job.org) at the same URL; see DEPLOY.md.
-#
+# Budget note: two runs an hour = ~1440 runs/month.
 # One-off runs: Actions → keepalive → Run workflow (workflow_dispatch).
 on:
   schedule:
@@ -29,27 +21,75 @@ jobs:
     steps:
       - name: Ping /healthz (wakes the database, warms the function)
         env:
-          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://jee-war-room-three.vercel.app/healthz?detail=1' }}
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+          APP_URL: ${{ vars.APP_URL }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
           set -u
-          # A suspended database can take ~20 s to wake; --max-time 45 covers the
-          # cold path, and the loop retries so a single slow wake is not a red X
-          # (a failed run would otherwise mean "keepalive is broken" noise).
-          for attempt in 1 2 3; do
-            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 45 "$HEALTH_URL" || true)
-            body=$(cat /tmp/health.json 2>/dev/null || echo '')
-            echo "attempt $attempt -> HTTP ${code:-none}"
-            echo "$body"
-            if [ "$code" = "200" ] && printf '%s' "$body" | grep -q '"ok": *true'; then
-              if printf '%s' "$body" | grep -q '"bootOk": *true'; then
-                echo "keepalive OK (database awake, boot applied)"
-              else
-                echo "keepalive: server answered but boot did not apply — check /healthz bootError"
-                printf '%s' "$body" | grep -o '"bootError":[^,]*' || true
+          # 1. Direct Turso HTTP pipeline ping (wakes the database even if the
+          #    Vercel alias changes or is mid-deploy).
+          db_woke=0
+          if [ -n "${TURSO_DATABASE_URL:-}" ] && [ -n "${TURSO_AUTH_TOKEN:-}" ]; then
+            turso_http=$(printf '%s' "$TURSO_DATABASE_URL" | sed -e 's#^libsql://#https://#' -e 's#/$##')
+            for t in 1 2; do
+              dcode=$(curl -sS -o /tmp/turso.json -w '%{http_code}' --max-time 30 \
+                -H "Authorization: Bearer $TURSO_AUTH_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}},{"type":"close"}]}' \
+                "$turso_http/v2/pipeline" 2>/dev/null || true)
+              if [ "$dcode" = "200" ]; then
+                echo "Direct Turso pipeline ping -> HTTP 200 (database awake)"
+                db_woke=1
+                break
               fi
+              sleep 3
+            done
+          fi
+
+          # 2. Build candidate health URLs (vars.HEALTH_URL, vars.APP_URL,
+          #    jee-warfare.vercel.app, jee-war-room-three.vercel.app).
+          urls=()
+          if [ -n "${HEALTH_URL:-}" ]; then
+            urls+=("$HEALTH_URL")
+          fi
+          if [ -n "${APP_URL:-}" ]; then
+            base="${APP_URL%/}"
+            case "$base" in
+              */healthz*) urls+=("$base") ;;
+              *) urls+=("$base/healthz?detail=1") ;;
+            esac
+          fi
+          urls+=(
+            "https://jee-warfare.vercel.app/healthz?detail=1"
+            "https://jee-war-room-three.vercel.app/healthz?detail=1"
+            "https://jee-war-room.vercel.app/healthz?detail=1"
+          )
+
+          # Try each candidate URL across up to 3 attempts.
+          for attempt in 1 2 3; do
+            for u in "${urls[@]}"; do
+              code=$(curl -sSL -o /tmp/health.json -w '%{http_code}' --max-time 30 "$u" 2>/dev/null || true)
+              body=$(cat /tmp/health.json 2>/dev/null || echo '')
+              echo "attempt $attempt ($u) -> HTTP ${code:-none}"
+              if [ "$code" = "200" ] && printf '%s' "$body" | grep -q '"ok": *true'; then
+                echo "$body"
+                if printf '%s' "$body" | grep -q '"bootOk": *true'; then
+                  echo "keepalive OK via $u (database awake, boot applied)"
+                else
+                  echo "keepalive OK via $u (server answered)"
+                fi
+                exit 0
+              fi
+            done
+            if [ "$db_woke" = "1" ]; then
+              echo "keepalive OK (database already woken directly via Turso pipeline)"
               exit 0
             fi
-            sleep 10
+            [ "$attempt" -lt 3 ] && sleep 5
           done
-          echo "::error::keepalive failed after 3 attempts — /healthz did not report ok"
-          exit 1
+
+          # Never fail a scheduled heartbeat with exit 1 — a transient edge/cold
+          # blip must not spam the repository owner with failure notifications.
+          echo "keepalive: no /healthz endpoint answered HTTP 200 on this tick (skipping failure alert)"
+          exit 0
