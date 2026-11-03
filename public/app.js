@@ -2244,14 +2244,14 @@ async function renderSettings(){
     <div class="muted" style="line-height:1.7">Every day a raw 0–100 preparation score is computed from your rolling last 14 days:
     consistency, target completion, question practice, revision and mock performance — minus distraction/missed penalties.
     The daily score uses momentum: <b>new = ${Math.round((1-set.airEMA)*100)}% × today + ${Math.round(set.airEMA*100)}% × yesterday</b>,
-    so one good day cannot jump your rank. AIR = <b>6,00,000 × e^(−0.064 × score)</b>, so gains get harder near the top.
+    and it moves at most <b>±1 point per day</b> (≈ ±6.5% AIR), so one good or bad day can never spike your rank. AIR = <b>6,00,000 × e^(−0.064 × score)</b>, so gains get harder near the top.
     Everyone starts at AIR 6,00,000. <b>It is a preparation trajectory, not an actual JEE rank prediction.</b></div>
     <div id="air-explain" class="muted">Loading live numbers…</div>
     <div class="sec-title">WEIGHTS (must total 100 for simplest reading)</div>
     ${[["consistency","Consistency"],["targets","Target completion"],["practice","Practice"],["revision","Revision"],["mock","Mock performance"]].map(([k,l])=>
       `<div class="set-row"><div class="grow">${l}</div>${inp("w-"+k,set.weights[k])} %</div>`).join("")}
     <div class="set-row"><div class="grow">Streak target completion threshold</div>${inp("streak-thr",set.streakThreshold)} %</div>
-    <div class="set-row"><div class="grow">Momentum smoothing (higher = slower AIR changes)</div>${inp("air-ema",set.airEMA,"0.01")}</div>
+    <div class="set-row"><div class="grow">Momentum smoothing <span class="muted sm">(0.50–0.97 · higher = slower AIR changes)</span></div>${ro?`<input class="numinput" type="number" step="0.01" min="0.5" max="0.97" id="air-ema" value="${set.airEMA}">`:`<b class="ro-val">${set.airEMA}</b>`}</div>
     ${isAdmin()?'<button class="btn-primary full" style="margin-top:10px" onclick="App.saveWeights()">SAVE GLOBAL FORMULA — APPLIES TO EVERYONE</button>':''}</div>`;
 
   // report a problem
@@ -2444,9 +2444,20 @@ async function saveXP(){
 }
 async function saveWeights(){
   const w={}; for(const k of Object.keys(state.me.settings.weights)) w[k]=parseInt($("#w-"+k).value)||0;
-  const thr=parseInt($("#streak-thr").value)||70, ema=parseFloat($("#air-ema").value)||0.88;
-  await saveSetting("weights",w); await saveSetting("general",{streakThreshold:thr,airEMA:ema});
-  toast("Saved — AIR recalculates from today","good"); renderSettings();
+  const thrRaw=($("#streak-thr").value||"").trim(), emaRaw=($("#air-ema").value||"").trim();
+  const thr=parseInt(thrRaw,10), ema=parseFloat(emaRaw);
+  // Never silently fall back to a default — that is what made a save look like
+  // it "didn't take". Reject empty/invalid input with a clear message instead.
+  if(emaRaw===""||!isFinite(ema)) return toast("Enter a momentum value between 0.50 and 0.97","bad");
+  if(thrRaw===""||!isFinite(thr)) return toast("Enter a streak threshold between 10 and 100","bad");
+  const emaC=Math.min(0.97,Math.max(0.5,ema)), thrC=Math.min(100,Math.max(10,thr));
+  try{
+    await saveSetting("weights",w);
+    await saveSetting("general",{streakThreshold:thrC,airEMA:emaC});
+    await reloadMe(false);   // refresh AIR everywhere, not just this screen
+    renderSettings();
+    toast((emaC!==ema||thrC!==thr)?"Saved — values adjusted to the allowed range":"Saved — AIR recalculated from today","good");
+  }catch(e){ toast(e.message||"Couldn't save — please try again","bad"); }
 }
 async function exportData(){
   const d=await api("/api/export");

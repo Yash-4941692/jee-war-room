@@ -448,7 +448,7 @@ def default_settings():
         "metrics": [],
         "templates": copy.deepcopy(SYL.TARGET_TEMPLATES),
         "streakThreshold": 70,
-        "airEMA": 0.88,
+        "airEMA": 0.90,
         "bestStreak": 0,
         "sweepDay": "",
         "seenAnnouncements": [],
@@ -764,6 +764,15 @@ def raw_score(c, uid, d, s):
 def air_for(score):
     return clamp(int(round(600000 * math.exp(-0.064 * score))), 1, 600000)
 
+# Momentum guardrail: the smoothed score may move at most this many points in a
+# single day, no matter how noisy the raw 14-day score is (a fresh account's
+# first logs, a mock decaying past its 21/60-day cliffs, or the rolling window
+# sliding can each swing the raw score by tens of points). Because AIR is an
+# exponential of the score, an uncapped swing turned into ±20–30% rank jumps in
+# one day. ±1.0 point ≈ ±6.5% AIR per day keeps the trajectory gradual while the
+# EMA (airEMA) still controls the everyday speed below this ceiling.
+AIR_MAX_DAILY_STEP = 1.0
+
 def ensure_snapshots(c, uid, s, force_today=False, created_at=None):
     """Backfill deterministic daily score/AIR snapshots up to today.
 
@@ -805,12 +814,15 @@ def ensure_snapshots(c, uid, s, force_today=False, created_at=None):
     if cur < today - timedelta(days=120):
         cur = today - timedelta(days=120)
         prev_score = 0.0
-    ema = clamp(s.get("airEMA", 0.88), 0.5, 0.97)
+    ema = clamp(s.get("airEMA", 0.90), 0.5, 0.97)
     guard = 0
     wrote = False
     while cur <= today and guard < 140:
         raw, _, _ = raw_score(c, uid, cur, s)
-        sc = round(ema * prev_score + (1 - ema) * raw, 2)
+        # momentum: EMA toward today's raw score, then a hard daily step cap so
+        # AIR can never spike or crash in a single day (see AIR_MAX_DAILY_STEP)
+        step = clamp((1 - ema) * (raw - prev_score), -AIR_MAX_DAILY_STEP, AIR_MAX_DAILY_STEP)
+        sc = round(prev_score + step, 2)
         c.execute("INSERT OR REPLACE INTO snapshots(user_id,day,score,air) VALUES(?,?,?,?)",
                   (uid, DAY_F(cur), sc, air_for(sc)))
         prev_score = sc; cur += timedelta(days=1); guard += 1
@@ -819,6 +831,23 @@ def ensure_snapshots(c, uid, s, force_today=False, created_at=None):
         c.commit()
     if not force_today:
         memo[key] = True
+
+def recalc_air_today(c):
+    """Recompute today's score/AIR snapshot for every user.
+
+    Called after the admin saves the global AIR formula (weights or momentum),
+    so the new rules take effect immediately instead of waiting for each user's
+    next logged activity. History is left untouched — only today is rebuilt, on
+    top of yesterday's stored score, which is exactly what 'recalculates from
+    today' promises. Cheap here: the rulebook is global and the user base is tiny.
+    """
+    for r in c.execute("SELECT id FROM users").fetchall():
+        uid = r["id"]
+        # Only rebuild accounts that already have AIR history. A dormant account
+        # with no snapshots computes its first one on next load anyway, and this
+        # avoids a costly from-signup backfill (many Turso round trips) here.
+        if c.execute("SELECT 1 FROM snapshots WHERE user_id=? LIMIT 1", (uid,)).fetchone():
+            ensure_snapshots(c, uid, get_settings(c, uid), force_today=True)
 
 def level_info(xp):
     L = 1
@@ -1942,7 +1971,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                "label": "Preparation trajectory — not an actual JEE rank prediction."}
         if with_comps:
             raw, comps, detail = raw_score(c, uid, datetime.now(IST).date(), s)
-            out.update({"rawToday": raw, "components": comps, "detail": detail, "weights": s["weights"], "ema": s.get("airEMA", 0.88)})
+            out.update({"rawToday": raw, "components": comps, "detail": detail, "weights": s["weights"], "ema": s.get("airEMA", 0.90)})
         return out
 
     def _friend_view(self, c, uid, pid):
@@ -3191,12 +3220,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for k, v in data["activitiesEnabled"].items():
                     if k in g["activitiesEnabled"]: g["activitiesEnabled"][k] = bool(v)
             save_admin_settings(c, g)
+            if isinstance(data.get("weights"), dict) or isinstance(data.get("general"), dict):
+                recalc_air_today(c)
             return self._send({"ok": True, "settings": get_settings(c, uid), "global": g})
         # sections below are admin-controlled global rules
         if section in ("xp", "weights", "general"):
             if not is_admin: return self._err("Only the admin can change this global rule.", 403)
             g = admin_settings(c)
-            payload = {"xp": data} if section == "xp" else ({"weights": data} if section == "weights" else {"general": data})
             if section == "xp":
                 for k, v in data.items():
                     if k in g["xp"]:
@@ -3215,6 +3245,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try: g["airEMA"] = clamp(float(data["airEMA"]), 0.5, 0.97)
                     except Exception: pass
             save_admin_settings(c, g)
+            if section in ("weights", "general"):
+                recalc_air_today(c)
             return self._send({"ok": True, "settings": get_settings(c, uid), "global": g})
         if section == "activities" and isinstance(data.get("enabled"), dict):
             if not is_admin: return self._err("Only the admin can enable/disable activity types globally.", 403)
